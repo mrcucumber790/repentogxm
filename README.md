@@ -31,8 +31,10 @@ updates per second; the port presents up to 60 frames per second.
 [Video of v0.1.1-alpha and v0.1.0-alpha in same rooms](https://www.youtube.com/watch?v=1u4kBMvUUZI)
 
 The current release is v0.1.1-alpha (2026-09-07);
-[release/RELEASE_NOTES.md](release/RELEASE_NOTES.md) lists what changed.
-Telegram channel with any updates: [@localgxm](https://t.me/localgxm)
+[release/RELEASE_NOTES.md](release/RELEASE_NOTES.md) lists what changed. 
+
+Telegram channel with any updates: [@localgxm](https://t.me/localgxm). 
+
 Measured on one PS Vita with EID loaded ([STATUS.md](STATUS.md) names the
 build behind each number):
 
