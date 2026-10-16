@@ -11,6 +11,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(isaac_linux64 C)
 
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "build type" FORCE)
+endif()
+
 set(ISAAC_GENERATED_DIR "" CACHE PATH "gen_all.py output directory")
 set(ISAAC_GUEST_BASE "0x98000000" CACHE STRING "guest image base")
 if(NOT IS_DIRECTORY "${ISAAC_GENERATED_DIR}" OR
