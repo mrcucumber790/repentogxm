@@ -52,10 +52,22 @@ set(ISAAC_RUNTIME_SOURCES
   "${ISAAC_RUNTIME}/host_vita_user32.c"
   "${ISAAC_RUNTIME}/vita_sync_services.c"
   "${ISAAC_RUNTIME}/gl_bridge.c"
-  "${ISAAC_RUNTIME}/manual_portable.c"
-  # First-fault stage: no renderer yet, the KAGE hooks stay inert.
-  "${ISAAC_RUNTIME}/kage_pc_disabled.c"
-  "${ISAAC_RUNTIME}/manual_kage_disabled.c")
+  "${ISAAC_RUNTIME}/manual_portable.c")
+
+# Renderer: SDL2 window + desktop GL through the PC KAGE boundary
+# (manual_kage.c, gl_pc_backend.c), or inert hooks for the first-fault stage.
+option(ISAAC_SDL "SDL2/OpenGL renderer" ON)
+if(ISAAC_SDL)
+  find_package(SDL2 REQUIRED)
+  list(APPEND ISAAC_RUNTIME_SOURCES
+    "${ISAAC_RUNTIME}/manual_kage.c"
+    "${ISAAC_RUNTIME}/gl_pc_backend.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../sdl/kage_sdl_backend.c")
+else()
+  list(APPEND ISAAC_RUNTIME_SOURCES
+    "${ISAAC_RUNTIME}/kage_pc_disabled.c"
+    "${ISAAC_RUNTIME}/manual_kage_disabled.c")
+endif()
 
 set(ISAAC_HOST_SOURCES
   main_linux.c
@@ -107,3 +119,6 @@ set_property(SOURCE "${ISAAC_RUNTIME}/guest.c" APPEND PROPERTY
 
 find_package(Threads REQUIRED)
 target_link_libraries(isaac-linux64 PRIVATE Threads::Threads m)
+if(ISAAC_SDL)
+  target_link_libraries(isaac-linux64 PRIVATE SDL2::SDL2)
+endif()

@@ -36,12 +36,12 @@ void sub_00565030(CPU *__restrict c);
  * backend owns that policy, while this global remains the guest-visible
  * current state used by later option changes. */
 #define OPTIONS_VSYNC_OFFSET   0x00000055u
-#define KAGE_VSYNC_STATE       0x307c7b0du
+#define KAGE_VSYNC_STATE       (GUEST_IMAGE_BASE + 0x007c7b0du)
 
 /* Exact KAGE::Sound::Manager singleton and fields used by sub_0056dd70.  Its
  * caller ignores AL, and the original alcOpenDevice(NULL) failure path leaves
  * the manager uninitialised and continues startup. */
-#define KAGE_SOUND_MANAGER_ADDRESS  0x307e7d40u
+#define KAGE_SOUND_MANAGER_ADDRESS  (GUEST_IMAGE_BASE + 0x007e7d40u)
 #define KAGE_SOUND_RUNNING          0x00000004u
 #define KAGE_SOUND_SUSPENDED        0x00000005u
 #define KAGE_SOUND_CONTEXT          0x00000030u
@@ -51,10 +51,10 @@ void sub_00565030(CPU *__restrict c);
  * width query publishes RECT.bottom before RECT.right; the height query
  * publishes RECT.right before RECT.bottom.  Several unrelated callers read
  * these four globals directly, so returning EAX alone is not equivalent. */
-#define KAGE_WIDTH_CACHE       0x308071a0u
-#define KAGE_HEIGHT_CACHE      0x308071a4u
-#define KAGE_HEIGHT_COMPANION  0x308071acu
-#define KAGE_WIDTH_COMPANION   0x308071a8u
+#define KAGE_WIDTH_CACHE       (GUEST_IMAGE_BASE + 0x008071a0u)
+#define KAGE_HEIGHT_CACHE      (GUEST_IMAGE_BASE + 0x008071a4u)
+#define KAGE_HEIGHT_COMPANION  (GUEST_IMAGE_BASE + 0x008071acu)
+#define KAGE_WIDTH_COMPANION   (GUEST_IMAGE_BASE + 0x008071a8u)
 
 static int use_original(CPU *__restrict c, guest_fn original)
 {

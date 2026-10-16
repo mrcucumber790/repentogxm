@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "gl_bridge.h"
@@ -46,10 +47,16 @@ static void gl_pc_record_missing(const char *name)
         s_gl_pc_missing[s_gl_pc_missing_count++] = name;
 }
 
-#if defined(_WIN32) && UINTPTR_MAX == UINT32_MAX
+#if (defined(_WIN32) && UINTPTR_MAX == UINT32_MAX) || GUEST_MEM_WINDOW
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+/* 64-bit window hosts (SDL + desktop GL): native pointers come from
+ * kage_pc_backend_gl_proc(); guest addresses are translated per call. */
+#define APIENTRY
+#endif
 
 /* Exact Khronos scalar layout, without importing a second GL header into the
  * guest ABI translation unit. */
@@ -67,6 +74,86 @@ typedef unsigned char GLubyte;
 static void gl_pc_debug_after_call(const char *name)
 {
     kage_pc_backend_note_guest_gl_call(name);
+}
+
+/* glGetString results are driver memory.  The guest receives a copy inside
+ * guest-addressable memory, made once per (name, index) and kept for the
+ * life of the process, matching the driver's own lifetime guarantee. */
+#define GL_PC_STRING_SLOTS 512u
+
+typedef struct gl_pc_string_slot {
+    uint32_t name;
+    uint32_t index;
+    char *copy;
+} gl_pc_string_slot;
+
+static gl_pc_string_slot s_gl_pc_strings[GL_PC_STRING_SLOTS];
+
+static guest_gl_addr gl_pc_guest_string(guest_gl_enum name, uint32_t index,
+                                        const GLubyte *native)
+{
+#if GUEST_MEM_WINDOW
+    size_t i;
+    size_t length;
+
+    if (!native)
+        return 0u;
+    for (i = 0u; i < GL_PC_STRING_SLOTS; ++i) {
+        gl_pc_string_slot *slot = &s_gl_pc_strings[i];
+        if (slot->copy && slot->name == name && slot->index == index)
+            return guest_addr(slot->copy);
+        if (!slot->copy) {
+            length = strlen((const char *)native) + 1u;
+            slot->copy = (char *)malloc(length);
+            if (!slot->copy)
+                return 0u;
+            memcpy(slot->copy, native, length);
+            slot->name = name;
+            slot->index = index;
+            return guest_addr(slot->copy);
+        }
+    }
+    return 0u;
+#else
+    (void)name;
+    (void)index;
+    (void)s_gl_pc_strings;
+    return (guest_gl_addr)(uintptr_t)native;
+#endif
+}
+
+typedef void (APIENTRY *gl_pc_shader_source_fn)(
+    GLuint shader, GLsizei count, const GLchar *const *string,
+    const GLint *length);
+
+/* The guest passes an array of 32-bit guest string addresses. */
+static void gl_pc_shader_source(gl_pc_shader_source_fn native,
+                                guest_gl_uint shader, guest_gl_sizei count,
+                                guest_gl_addr strings, guest_gl_addr lengths)
+{
+#if GUEST_MEM_WINDOW
+    const GLchar *local[16];
+    const GLchar **host = local;
+    guest_gl_sizei i;
+
+    if (count < 0)
+        count = 0;
+    if ((size_t)count > sizeof local / sizeof local[0]) {
+        host = (const GLchar **)malloc((size_t)count * sizeof *host);
+        if (!host)
+            return;
+    }
+    for (i = 0; i < count; ++i)
+        host[i] = (const GLchar *)guest_ptr(ld32(strings + 4u * (uint32_t)i));
+    native((GLuint)shader, (GLsizei)count, host,
+           (const GLint *)guest_ptr(lengths));
+    if (host != local)
+        free((void *)host);
+#else
+    native((GLuint)shader, (GLsizei)count,
+           (const GLchar *const *)(uintptr_t)strings,
+           (const GLint *)(uintptr_t)lengths);
+#endif
 }
 
 #include "gl_pc_backend_generated.inc"

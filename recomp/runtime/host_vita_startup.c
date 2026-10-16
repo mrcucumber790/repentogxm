@@ -285,6 +285,24 @@ static void vita_startup_GetSystemInfo(CPU *__restrict c)
     vita_startup_stdcall_return(c, 4U);
 }
 
+/* GLFW's Windows joystick backend probes XInput, then DirectInput 8, when a
+ * platform keeps GLFW initialised (the PC KAGE boundary).  Absent modules
+ * select GLFW's no-joystick path; the host backend supplies input itself. */
+static int vita_startup_optional_input_module(const char *module)
+{
+    static const char *const modules[] = {
+        "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll",
+        "xinput1_2.dll", "xinput1_1.dll", "bin\\xinput1_3.dll",
+        "dinput8.dll"
+    };
+    size_t i;
+
+    for (i = 0U; i < sizeof modules / sizeof modules[0]; ++i)
+        if (vita_startup_module_equal(module, modules[i]))
+            return 1;
+    return 0;
+}
+
 static void vita_startup_LoadLibraryA(CPU *__restrict c)
 {
     uint32_t name = vita_startup_arg(c, 0U);
@@ -301,7 +319,9 @@ static void vita_startup_LoadLibraryA(CPU *__restrict c)
         !vita_startup_module_equal(
             module, ISAAC_VITA_STARTUP_LOAD_USERENV_MODULE) &&
         !vita_startup_module_equal(
-            module, ISAAC_VITA_STARTUP_LOAD_WINMM_MODULE)) {
+            module, ISAAC_VITA_STARTUP_LOAD_WINMM_MODULE) &&
+        !vita_startup_optional_input_module(module)) {
+        isaac_vita_log("LoadLibraryA: unexpected module %s", module);
         guest_fault(c, name, "LoadLibraryA received an unexpected module");
         return;
     }
