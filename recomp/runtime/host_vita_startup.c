@@ -478,7 +478,7 @@ static void vita_startup_GetCurrentDirectoryA(CPU *__restrict c)
             c, output, length + 1U,
             "GetCurrentDirectoryA received an invalid output range"))
         return;
-    memcpy((void *)(uintptr_t)output, ISAAC_VITA_DATA_ROOT, length + 1U);
+    memcpy((void *)guest_ptr(output), ISAAC_VITA_DATA_ROOT, length + 1U);
     c->eax = length;
     vita_startup_stdcall_return(c, 8U);
 }

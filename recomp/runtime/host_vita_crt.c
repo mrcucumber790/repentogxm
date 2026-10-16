@@ -147,13 +147,17 @@ typedef struct vita_crt_import_entry {
     vita_crt_import_fn fn;
 } vita_crt_import_entry;
 
-isaac_vita_crt_state g_isaac_vita_crt = {
-    0U, 0U, 0U, 0U,
-    0x00010000U,                 /* _PC_53, copied from host_win32.c */
-    0, 0U
-};
+#define VITA_CRT_STATE_INIT {                                      \
+    0U, 0U, 0U, 0U,                                                \
+    0x00010000U,                 /* _PC_53, copied from host_win32.c */ \
+    0, 0U                                                          \
+}
+#define VITA_CRT_ARGV0 "isaac-ng.exe"
+#if !GUEST_MEM_WINDOW
+isaac_vita_crt_state g_isaac_vita_crt = VITA_CRT_STATE_INIT;
 int32_t g_isaac_vita_crt_errno;
 static uint32_t s_time_tm[ISAAC_VITA_CRT_TM_DWORD_COUNT];
+#endif
 
 /* Kept externally observable for the later exit boundary, exactly as the
  * count is.  A write-only TU-local table is dead-store-eliminated before that
@@ -163,14 +167,16 @@ static volatile uint32_t s_atexit_lock;
 static volatile uint32_t s_exit_running;
 static uint32_t s_tls_atexit;
 static uint32_t s_tls_atexit_registered;
-static uint32_t s_empty_environment[1];
 static uint32_t s_empty_environment_pointer;
-static char s_argv0[] = "isaac-ng.exe";
+static int s_environment_ready;
+#if !GUEST_MEM_WINDOW
+static uint32_t s_empty_environment[1];
+static char s_argv0[] = VITA_CRT_ARGV0;
 static uint32_t s_argv[2];
 static uint32_t s_argv_pointer;
 static int32_t s_argc = 1;
-static int s_environment_ready;
 static char s_user_profile[] = ISAAC_VITA_DATA_ROOT;
+#endif
 
 #if defined(ISAAC_VITA_IO_PROFILE)
 enum {
@@ -241,7 +247,59 @@ typedef struct vita_crt_file_token {
 #endif
 } vita_crt_file_token;
 
+#if GUEST_MEM_WINDOW
+/* Everything whose address the guest receives (FILE tokens, errno, argv,
+ * the static struct tm), allocated once inside the guest window. */
+typedef struct vita_crt_guest_statics {
+    isaac_vita_crt_state crt;
+    int32_t errno_value;
+    int32_t argc;
+    uint32_t time_tm[ISAAC_VITA_CRT_TM_DWORD_COUNT];
+    uint32_t empty_environment[1];
+    uint32_t argv[2];
+    uint32_t argv_pointer;
+    char argv0[sizeof VITA_CRT_ARGV0];
+    char user_profile[sizeof ISAAC_VITA_DATA_ROOT];
+    vita_crt_file_token file_tokens[ISAAC_VITA_CRT_FILE_TOKEN_COUNT];
+    /* Stand-ins for UCRT's _iob[]: the guest only passes these back. */
+    uint32_t standard_streams[ISAAC_VITA_CRT_STANDARD_STREAM_COUNT];
+} vita_crt_guest_statics;
+
+static vita_crt_guest_statics *s_crt_guest;
+isaac_vita_crt_state *g_isaac_vita_crt_window;
+int32_t *g_isaac_vita_crt_errno_window;
+#define s_time_tm (s_crt_guest->time_tm)
+#define s_empty_environment (s_crt_guest->empty_environment)
+#define s_argv0 (s_crt_guest->argv0)
+#define s_argv (s_crt_guest->argv)
+#define s_argv_pointer (s_crt_guest->argv_pointer)
+#define s_argc (s_crt_guest->argc)
+#define s_user_profile (s_crt_guest->user_profile)
+#define s_file_tokens (s_crt_guest->file_tokens)
+
+int isaac_vita_crt_window_init(void)
+{
+    static const isaac_vita_crt_state initial = VITA_CRT_STATE_INIT;
+    vita_crt_guest_statics *statics;
+
+    if (s_crt_guest)
+        return 0;
+    statics = (vita_crt_guest_statics *)calloc(1, sizeof *statics);
+    if (!statics)
+        return -1;
+    statics->crt = initial;
+    statics->argc = 1;
+    memcpy(statics->argv0, VITA_CRT_ARGV0, sizeof VITA_CRT_ARGV0);
+    memcpy(statics->user_profile, ISAAC_VITA_DATA_ROOT,
+           sizeof ISAAC_VITA_DATA_ROOT);
+    g_isaac_vita_crt_window = &statics->crt;
+    g_isaac_vita_crt_errno_window = &statics->errno_value;
+    s_crt_guest = statics;
+    return 0;
+}
+#else
 static vita_crt_file_token s_file_tokens[ISAAC_VITA_CRT_FILE_TOKEN_COUNT];
+#endif
 #if defined(ISAAC_VITA_CRT_FILE_LOOKUP_HINT) && ISAAC_VITA_CRT_FILE_LOOKUP_HINT
 /* All access is under s_file_lock.  This stores no FILE pointer.  Invalidate
  * at both token-publication sites: the remembered linear-search first match
@@ -1412,6 +1470,8 @@ static void vita_crt_recover_log_receipt(
  * assemblable without changing the production ARM instruction. */
 #if defined(ISAAC_VITA_CRT_QSORT_HOST_ORACLE)
 #define VITA_CRT_SPIN_HINT() __asm__ volatile("" ::: "memory")
+#elif defined(__x86_64__) || defined(__i386__)
+#define VITA_CRT_SPIN_HINT() __asm__ volatile("pause" ::: "memory")
 #else
 #define VITA_CRT_SPIN_HINT() __asm__ volatile("yield" ::: "memory")
 #endif
@@ -1458,7 +1518,7 @@ static void vita_crt_stdcall_return(CPU *__restrict c,
 static int vita_crt_guest_pointer(CPU *__restrict c, const void *pointer,
                                   uint32_t *result)
 {
-    uintptr_t address = (uintptr_t)pointer;
+    uintptr_t address = (uintptr_t)pointer - GUEST_MEM_BASE;
 #if UINTPTR_MAX > UINT32_MAX
     if (address > UINT32_MAX) {
         guest_fault(c, 0U, "Vita CRT storage is not a 32-bit guest pointer");
@@ -2078,8 +2138,8 @@ static void vita_crt_strftime(CPU *__restrict c)
         g_isaac_vita_crt_errno = EINVAL;
     } else if (capacity) {
         vita_crt_load_tm(time_value, &value);
-        result = strftime((char *)(uintptr_t)destination, (size_t)capacity,
-                          (const char *)(uintptr_t)format, &value);
+        result = strftime((char *)guest_ptr(destination), (size_t)capacity,
+                          (const char *)guest_ptr(format), &value);
     }
     c->eax = (uint32_t)result;
     errno = saved_errno;
@@ -2683,7 +2743,7 @@ static void vita_crt_room_log_completed(
         !(c->esp + 4U <= buffer || c->esp >= ISAAC_VITA_CRT_ROOM_LOG_BUFFER_END) ||
         ld32(frame + 4U) != ISAAC_VITA_CRT_ROOM_LOG_ORIGIN_RETURN_RVA ||
         ld32(frame + 8U) != 0U || ld32(frame + 12U) != format ||
-        memcmp((const void *)(uintptr_t)format, ISAAC_VITA_CRT_ROOM_LOG_FORMAT,
+        memcmp((const void *)guest_ptr(format), ISAAC_VITA_CRT_ROOM_LOG_FORMAT,
                sizeof ISAAC_VITA_CRT_ROOM_LOG_FORMAT) != 0)
         return;
     saved_errno = errno;
@@ -3465,6 +3525,18 @@ void isaac_vita_crt_archive_cache_shutdown(void)
 #endif
 }
 
+static FILE *vita_crt_standard_stream(uint32_t index);
+/* Guest-visible token of standard stream `index`: the host FILE on 32-bit
+ * hosts, a slot inside the guest window otherwise. */
+static uint32_t vita_crt_standard_token(uint32_t index)
+{
+#if GUEST_MEM_WINDOW
+    return guest_addr(&s_crt_guest->standard_streams[index]);
+#else
+    return (uint32_t)(uintptr_t)vita_crt_standard_stream(index);
+#endif
+}
+
 static FILE *vita_crt_standard_stream(uint32_t index)
 {
     if (index == 0U)
@@ -3486,7 +3558,7 @@ static int vita_crt_find_file_token_unlocked(uint32_t token, FILE **stream,
 
     for (i = 0U; i < ISAAC_VITA_CRT_STANDARD_STREAM_COUNT; ++i) {
         FILE *standard = vita_crt_standard_stream(i);
-        if ((uint32_t)(uintptr_t)standard == token) {
+        if (vita_crt_standard_token(i) == token) {
             if (stream)
                 *stream = standard;
             if (dynamic_index)
@@ -4299,11 +4371,11 @@ static void vita_crt_fread(CPU *__restrict c)
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
     if (index >= 0 && s_file_tokens[index].raw_archive.live)
         result = vita_crt_raw_archive_fread(
-            &s_file_tokens[index], (void *)(uintptr_t)buffer, size, count);
+            &s_file_tokens[index], (void *)guest_ptr(buffer), size, count);
     else
 #endif
         result = vita_crt_native_fread(
-            (void *)(uintptr_t)buffer, size, count, stream);
+            (void *)guest_ptr(buffer), size, count, stream);
     read_errno = errno;
 #if defined(ISAAC_VITA_CRT_DESCRIPTOR_RECOVER)
     if (recover_armed && result < count && read_errno == ENODEV &&
@@ -4317,11 +4389,11 @@ static void vita_crt_fread(CPU *__restrict c)
         if (s_file_tokens[index].raw_archive.live) {
             s_file_tokens[index].raw_archive.error = recover_raw_error;
             result = vita_crt_raw_archive_fread(
-                &s_file_tokens[index], (void *)(uintptr_t)buffer, size,
+                &s_file_tokens[index], (void *)guest_ptr(buffer), size,
                 count);
         } else {
             result = vita_crt_native_fread(
-                (void *)(uintptr_t)buffer, size, count, stream);
+                (void *)guest_ptr(buffer), size, count, stream);
         }
         read_errno = errno;
     }
@@ -4500,10 +4572,10 @@ static void vita_crt_fwrite(CPU *__restrict c)
     errno = 0;
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
     result = vita_crt_file_fwrite(
-        (const void *)(uintptr_t)buffer, size, count, stream, index);
+        (const void *)guest_ptr(buffer), size, count, stream, index);
     failed = result < count && vita_crt_file_ferror(stream, index);
 #else
-    result = fwrite((const void *)(uintptr_t)buffer, size, count, stream);
+    result = fwrite((const void *)guest_ptr(buffer), size, count, stream);
     failed = result < count && ferror(stream);
 #endif
     vita_crt_file_unlock();
@@ -4783,8 +4855,7 @@ static void vita_crt_acrt_iob_func(CPU *__restrict c)
         guest_fault(c, index, "__acrt_iob_func index outside 0..2");
         return;
     }
-    if (!vita_crt_guest_pointer(c, stream, &token))
-        return;
+    token = vita_crt_standard_token(index);
     c->eax = token;
     vita_crt_cdecl_return(c);
 }

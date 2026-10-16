@@ -267,10 +267,10 @@ uint64_t guest_atomic_cmpxchg64(uint32_t addr, uint64_t expected,
     /* GCC 10.3 for the Vita emits this inline as LDREXD/STREXD plus DMB; the
      * final softfp ARM link has no libatomic or libgcc helper dependency. */
     return __sync_val_compare_and_swap(
-        (volatile uint64_t *)(uintptr_t)addr, expected, desired);
+        (volatile uint64_t *)guest_ptr(addr), expected, desired);
 #else
     return (uint64_t)InterlockedCompareExchange64(
-        (volatile LONG64 *)(uintptr_t)addr,
+        (volatile LONG64 *)guest_ptr(addr),
         (LONG64)desired, (LONG64)expected);
 #endif
 }
@@ -775,11 +775,11 @@ static int setup_static_tls(uint32_t directory_rva, uint32_t directory_size)
         return 1;
     }
     if (template_size)
-        memcpy(g_tls_block, (void *)(uintptr_t)start, template_size);
+        memcpy(g_tls_block, (void *)guest_ptr(start), template_size);
     g_tls_block_size = total_size;
     g_tls_index = 0U;             /* first slot in our private fake TIB array */
     g_guest_fs_base_cached = 0U;
-    *(uint32_t *)(uintptr_t)index_address = g_tls_index;
+    *(uint32_t *)guest_ptr(index_address) = g_tls_index;
 
     g_tls_callback_count = 0U;
     if (callbacks_address) {
@@ -790,7 +790,7 @@ static int setup_static_tls(uint32_t directory_rva, uint32_t directory_size)
                 fprintf(stderr, "guest: unterminated TLS callback array\n");
                 return 1;
             }
-            callback = *(uint32_t *)(uintptr_t)cell;
+            callback = *(uint32_t *)guest_ptr(cell);
             if (!callback) break;
             if (!guest_image_contains(callback, 1U)) {
                 fprintf(stderr, "guest: TLS callback %08x is outside the image\n",
@@ -866,7 +866,7 @@ void guest_image_free(void)
     if (g_tib && g_tls_index < GUEST_TLS_SLOTS) {
         uint32_t tls_array = *(uint32_t *)(g_tib + 0x2C);
         if (tls_array)
-            *(uint32_t *)(uintptr_t)(tls_array + g_tls_index * 4U) = 0U;
+            *(uint32_t *)guest_ptr(tls_array + g_tls_index * 4U) = 0U;
     }
     if (g_tls_block) free(g_tls_block);
     g_tls_block = NULL;
@@ -1220,10 +1220,10 @@ int guest_stack_init(CPU *c)
     if (!p) {
         return 1;
     }
-    base = (uint32_t)(uintptr_t)p;
+    base = guest_addr(p);
     if (
 #if UINTPTR_MAX > UINT32_MAX
-        (uintptr_t)p > UINT32_MAX ||
+        (uintptr_t)p - GUEST_MEM_BASE > UINT32_MAX ||
 #endif
         GUEST_STACK_SIZE <=
             GUEST_STACK_LOW_MARGIN + GUEST_STACK_TOP_MARGIN ||
@@ -2851,7 +2851,7 @@ int guest_tls_process_attach(CPU *__restrict c)
     }
     tls_array = ld32(fs + 0x2CU);
     if (!tls_array || ld32(tls_array + g_tls_index * 4U) !=
-                      (uint32_t)(uintptr_t)g_tls_block) {
+                      guest_addr(g_tls_block)) {
         guest_fault(c, 0U, "static TLS block was not bound into the guest TIB");
         return 1;
     }
@@ -2980,7 +2980,7 @@ uint32_t guest_fs_base(CPU *c)
         uint32_t self, tls;
         g_tib = (unsigned char *)calloc(1, 4096);
         if (!g_tib) return 0;
-        self = (uint32_t)(uintptr_t)g_tib;
+        self = guest_addr(g_tib);
         tls = self + 0x100U;        /* zeroed 64-entry TLS pointer array */
         *(uint32_t *)(g_tib + 0x00) = 0xFFFFFFFFu; /* SEH chain head */
         *(uint32_t *)(g_tib + 0x18) = self;        /* NT_TIB.Self */
@@ -2999,11 +2999,11 @@ uint32_t guest_fs_base(CPU *c)
     *(uint32_t *)(g_tib + 0x08) = g_stack_base;
     if (g_tls_block && g_tls_index < GUEST_TLS_SLOTS) {
         uint32_t tls = *(uint32_t *)(g_tib + 0x2C);
-        *(uint32_t *)(uintptr_t)(tls + g_tls_index * 4U) =
-            (uint32_t)(uintptr_t)g_tls_block;
+        *(uint32_t *)guest_ptr(tls + g_tls_index * 4U) =
+            guest_addr(g_tls_block);
     }
     /* Every word written above is now current; generated units compiled with
      * GUEST_FS_BASE_INLINE answer from this until a writer above changes it. */
-    g_guest_fs_base_cached = (uint32_t)(uintptr_t)g_tib;
-    return (uint32_t)(uintptr_t)g_tib;
+    g_guest_fs_base_cached = guest_addr(g_tib);
+    return guest_addr(g_tib);
 }

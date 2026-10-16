@@ -129,8 +129,8 @@ static int vita_memory_range_validate(uint32_t address, uint32_t count,
          * require the complete range below.  The ByRange export is absent in
          * current emulator implementations even though VitaSDK declares it. */
         int result = sceKernelGetMemBlockInfoByAddr(
-            (void *)(uintptr_t)address, &info);
-        mapped_base = (uint32_t)(uintptr_t)info.mappedBase;
+            (void *)guest_ptr(address), &info);
+        mapped_base = guest_addr(info.mappedBase);
         mapped_size = (uint32_t)info.mappedSize;
         access = (uint32_t)info.access;
 #else
@@ -361,7 +361,7 @@ static void vita_memory_memset(CPU *__restrict c)
     }
 #endif
     if (count)
-        memset((void *)(uintptr_t)destination, value, (size_t)count);
+        memset((void *)guest_ptr(destination), value, (size_t)count);
     c->eax = destination;
     vita_memory_cdecl_return(c);
 }
@@ -391,8 +391,8 @@ static void vita_memory_memcpy(CPU *__restrict c)
                 &probe);
             return;
         }
-        memcpy((void *)(uintptr_t)destination,
-               (const void *)(uintptr_t)source, (size_t)count);
+        memcpy((void *)guest_ptr(destination),
+               (const void *)guest_ptr(source), (size_t)count);
     }
     c->eax = destination;
     vita_memory_cdecl_return(c);
@@ -423,8 +423,8 @@ static void vita_memory_memmove(CPU *__restrict c)
                 &probe);
             return;
         }
-        memmove((void *)(uintptr_t)destination,
-                (const void *)(uintptr_t)source, (size_t)count);
+        memmove((void *)guest_ptr(destination),
+                (const void *)guest_ptr(source), (size_t)count);
     }
     c->eax = destination;
     vita_memory_cdecl_return(c);

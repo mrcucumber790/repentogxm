@@ -961,11 +961,22 @@ typedef struct isaac_vita_crt_state {
     uint32_t atexit_count;
 } isaac_vita_crt_state;
 
+#if GUEST_MEM_WINDOW
+/* 64-bit hosts: the guest addresses these cells, so they live in the guest
+ * window (isaac_vita_crt_window_init) instead of host .data. */
+extern isaac_vita_crt_state *g_isaac_vita_crt_window;
+extern int32_t *g_isaac_vita_crt_errno_window;
+#define g_isaac_vita_crt (*g_isaac_vita_crt_window)
+#define g_isaac_vita_crt_errno (*g_isaac_vita_crt_errno_window)
+/* Allocates the guest-visible CRT statics; call once before guest code. */
+int isaac_vita_crt_window_init(void);
+#else
 extern isaac_vita_crt_state g_isaac_vita_crt;
 /* Stable guest-addressable errno cell.  The current Vita runtime has one
  * runnable guest thread; move this into per-thread CRT state when that
  * changes, matching UCRT's thread-local contract. */
 extern int32_t g_isaac_vita_crt_errno;
+#endif
 extern uint32_t g_isaac_vita_crt_atexit[ISAAC_VITA_CRT_ATEXIT_MAX];
 
 /* Public only so the focused host oracle can execute the exact production

@@ -517,7 +517,7 @@ static int vita_find_write_data(CPU *__restrict c, uint32_t output,
     if (!vita_find_utf8_to_utf16(c, name, utf16,
                                  ISAAC_VITA_FIND_DATA_NAME_UNITS))
         return 0;
-    memset((void *)(uintptr_t)output, 0, ISAAC_VITA_FIND_DATA_SIZE);
+    memset((void *)guest_ptr(output), 0, ISAAC_VITA_FIND_DATA_SIZE);
     if (status && SCE_S_ISDIR(status->st_mode))
         attributes = ISAAC_VITA_FIND_FILE_ATTRIBUTE_DIRECTORY;
     else

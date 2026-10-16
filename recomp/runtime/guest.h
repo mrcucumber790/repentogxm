@@ -325,13 +325,27 @@ extern uintptr_t g_guest_mem_base;
 #else
 #define GUEST_MEM_BASE ((uintptr_t)0)
 #endif
-/* Guest address -> host pointer, and back.  Host code that hands a pointer to
- * the guest must use guest_addr(), which is only valid for memory inside the
- * window (on 32-bit hosts, any pointer). */
+/* Guest address -> host pointer, and back.  GUEST_HOST is the raw mapping the
+ * ld/st helpers use.  Runtime code converts with guest_ptr()/guest_addr(),
+ * which keep NULL <-> 0; guest_addr() is only valid for memory inside the
+ * window (on 32-bit hosts, any pointer) and traps on anything else. */
 #define GUEST_HOST(a) ((void *)(GUEST_MEM_BASE + (uintptr_t)(uint32_t)(a)))
+static inline void *guest_ptr(uint32_t a)
+{
+    return a ? GUEST_HOST(a) : (void *)0;
+}
 static inline uint32_t guest_addr(const void *p)
 {
-    return (uint32_t)((uintptr_t)p - GUEST_MEM_BASE);
+#if GUEST_MEM_WINDOW
+    uintptr_t offset = (uintptr_t)p - GUEST_MEM_BASE;
+    if (!p)
+        return 0U;
+    if (offset > (uintptr_t)UINT32_MAX)
+        __builtin_trap(); /* host storage handed to the guest */
+    return (uint32_t)offset;
+#else
+    return (uint32_t)(uintptr_t)p;
+#endif
 }
 
 #ifdef GUEST_CHECKED_MEMORY
