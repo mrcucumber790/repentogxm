@@ -76,6 +76,21 @@ set(ISAAC_HOST_SOURCES
   guest_window.c
   linux_stubs.c)
 
+# Lua 5.3.3 (the game's Lua5.3.3r.dll) built natively; mods need it.
+set(ISAAC_LUA53_SOURCE_DIR "" CACHE PATH "extracted lua-5.3.3 source root")
+option(ISAAC_LUA "native Lua 5.3.3 bridge" ON)
+if(ISAAC_LUA)
+  if(NOT IS_DIRECTORY "${ISAAC_LUA53_SOURCE_DIR}/src")
+    message(FATAL_ERROR "ISAAC_LUA needs ISAAC_LUA53_SOURCE_DIR (lua-5.3.3)")
+  endif()
+  include("${ISAAC_VITA}/lua53_vanilla.cmake")
+  add_library(isaac_lua53 STATIC ${ISAAC_LUA53_C_SOURCES})
+  target_include_directories(isaac_lua53 PUBLIC "${ISAAC_LUA53_SOURCE_DIR}/src")
+  target_compile_options(isaac_lua53 PRIVATE -std=gnu11 -O2
+    -fno-strict-aliasing)
+  list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/host_vita_lua.c")
+endif()
+
 add_executable(isaac-linux64
   ${ISAAC_HOST_SOURCES}
   ${ISAAC_RUNTIME_SOURCES}
@@ -95,7 +110,7 @@ target_compile_definitions(isaac-linux64 PRIVATE
   GUEST_IMAGE_BASE=${ISAAC_GUEST_BASE}u
   GUEST_STACK_REQUIRED=1
   ISAAC_VITA_HAS_RUNTIME=1
-  ISAAC_VITA_LUA_OFF_CLOSE_NOOP=1
+  $<IF:$<BOOL:${ISAAC_LUA}>,ISAAC_VITA_LUA=1,ISAAC_VITA_LUA_OFF_CLOSE_NOOP=1>
   _GNU_SOURCE=1)
 
 target_compile_options(isaac-linux64 PRIVATE
@@ -114,11 +129,17 @@ string(REGEX MATCH "guest_generation_[0-9a-f]+" ISAAC_GENERATION_SYMBOL
 if(NOT ISAAC_GENERATION_SYMBOL)
   message(FATAL_ERROR "no generation symbol in guest_table.c")
 endif()
+# Dense import-ID dispatch, as in the Vita production target: every IAT row
+# (Lua included) resolves through host_vita_import_id.c.
 set_property(SOURCE "${ISAAC_RUNTIME}/guest.c" APPEND PROPERTY
-  COMPILE_DEFINITIONS GUEST_GENERATION_SYMBOL=${ISAAC_GENERATION_SYMBOL})
+  COMPILE_DEFINITIONS GUEST_GENERATION_SYMBOL=${ISAAC_GENERATION_SYMBOL}
+    ISAAC_VITA_IMPORT_ID_DISPATCH=1)
 
 find_package(Threads REQUIRED)
 target_link_libraries(isaac-linux64 PRIVATE Threads::Threads m)
 if(ISAAC_SDL)
   target_link_libraries(isaac-linux64 PRIVATE SDL2::SDL2)
+endif()
+if(ISAAC_LUA)
+  target_link_libraries(isaac-linux64 PRIVATE isaac_lua53)
 endif()
