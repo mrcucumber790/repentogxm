@@ -130,6 +130,55 @@ if(ISAAC_LUA)
   list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/host_vita_lua.c")
 endif()
 
+# Lua fast paths from the Vita release (recomp/vita/CMakeLists.txt): the
+# per-frame GC step clamp (the game asks for up to 10 MB per frame with a mod
+# loaded), one bounded step instead of the per-floor full collection, typed
+# endpoints for the hottest Lua imports, and native LuaBridge __index /
+# Userdata::getClass+getExact replays (translated fallback on any deviation).
+set(ISAAC_LUA_GCSTEP_CLAMP_KB 128 CACHE STRING
+  "per-frame lua_gc(LUA_GCSTEP) clamp, KB (0 = the game's own step)")
+option(ISAAC_LUA_GCCOLLECT_CLAMP
+  "floor-transition GCCOLLECT -> one bounded step" ON)
+set(ISAAC_LUA_GCCOLLECT_STEP_KB 256 CACHE STRING
+  "KB paid by the clamped floor-transition collection")
+option(ISAAC_LUA_FASTPATHS
+  "Lua typed import endpoints and native __index/getClass seams" ON)
+if(ISAAC_LUA)
+  if(ISAAC_LUA_GCSTEP_CLAMP_KB GREATER 0)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_LUA_GCSTEP_CLAMP_KB=${ISAAC_LUA_GCSTEP_CLAMP_KB})
+  endif()
+  if(ISAAC_LUA_GCCOLLECT_CLAMP)
+    list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/host_vita_lua_gc.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_lua.c"
+      "${ISAAC_RUNTIME}/host_vita_lua_gc.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_LUA_GCCOLLECT_CLAMP=1
+        ISAAC_VITA_LUA_GCCOLLECT_STEP_KB=${ISAAC_LUA_GCCOLLECT_STEP_KB})
+  endif()
+  if(ISAAC_LUA_FASTPATHS)
+    list(APPEND ISAAC_RUNTIME_SOURCES
+      "${ISAAC_RUNTIME}/host_vita_lua_getclass.c")
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_lua.c"
+      "${ISAAC_RUNTIME}/host_vita_import_id.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_LUA_IMPORT_FASTDISPATCH=1)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_LUA_NATIVE_INDEX=1)
+    set_property(SOURCE
+      "${ISAAC_RUNTIME}/host_vita_lua.c"
+      "${ISAAC_RUNTIME}/host_vita_lua_getclass.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_LUA_NATIVE_GETCLASS=1)
+    set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_lua_getclass.c"
+      APPEND PROPERTY COMPILE_DEFINITIONS
+        ISAAC_VITA_LUA_NATIVE_GETCLASS_WRAP=1
+        ISAAC_VITA_LUA_NATIVE_GETCLASS_BUILD_ID=\"linux64\")
+    list(APPEND ISAAC_WRAP_SYMBOLS sub_003f8e30 sub_003f8c80)
+  endif()
+endif()
+
 # Audio: the shared OpenAL adapter (host_vita_audio.c) over system OpenAL
 # Soft.  Only its owners see ISAAC_VITA_AUDIO, as in the Vita target.
 option(ISAAC_AUDIO "OpenAL audio" ON)
@@ -285,6 +334,75 @@ if(ISAAC_NATIVE_PNG)
       ISAAC_VITA_NATIVE_PNG=1
       ISAAC_VITA_NATIVE_PNG_RESERVE_MB=${ISAAC_NATIVE_PNG_RESERVE_MB})
   list(APPEND ISAAC_WRAP_SYMBOLS sub_005b1500)
+endif()
+
+# CRT: keep one idle read-only packed-archive FILE open for the next open
+# of the same archive (every resource load reopens its .a), and answer the
+# game's SEEK_END/ftell size probes on read-only streams from a cached size.
+option(ISAAC_ARCHIVE_FILE_CACHE
+  "Reuse an idle packed-archive FILE (ISAAC_VITA_ARCHIVE_FILE_CACHE)" ON)
+option(ISAAC_CRT_SEEK_SHADOW
+  "Cached-size SEEK_END/ftell on read-only FILEs (ISAAC_VITA_CRT_SEEK_SHADOW)" ON)
+if(ISAAC_CRT_SEEK_SHADOW AND NOT ISAAC_ARCHIVE_FILE_CACHE)
+  message(FATAL_ERROR "ISAAC_CRT_SEEK_SHADOW requires ISAAC_ARCHIVE_FILE_CACHE")
+endif()
+if(ISAAC_ARCHIVE_FILE_CACHE)
+  list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/host_vita_archive_cache.c")
+  set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_crt.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS
+      ISAAC_VITA_ARCHIVE_FILE_CACHE=1
+      ISAAC_VITA_ARCHIVE_DIAG_BUILD_ID=\"linux64\")
+endif()
+if(ISAAC_CRT_SEEK_SHADOW)
+  set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_crt.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_CRT_SEEK_SHADOW=1)
+endif()
+
+# libpng chunk CRC-32 byte loop (0x5c3320) natively, behind its generated
+# entry seam.
+option(ISAAC_PNG_CRC32_FASTPATH
+  "Native PNG chunk CRC-32 (ISAAC_VITA_PNG_CRC32_FASTPATH)" ON)
+if(ISAAC_PNG_CRC32_FASTPATH)
+  isaac_generated_owner(sub_005c3320 ISAAC_PNG_CRC32_OWNER)
+  list(APPEND ISAAC_RUNTIME_SOURCES
+    "${ISAAC_RUNTIME}/host_vita_png_crc32_native.c"
+    "${ISAAC_RUNTIME}/host_vita_png_crc32_guest.c")
+  set_property(SOURCE ${ISAAC_PNG_CRC32_OWNER}
+    "${ISAAC_RUNTIME}/host_vita_png_crc32_guest.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_PNG_CRC32_FASTPATH=1)
+endif()
+
+# Startup: skip re-validating packed-archive entries whose index checksum
+# matches the one baked into the PE (the generated owner keeps the original
+# validation for everything else).
+option(ISAAC_ARCHIVE_VALIDATION_SKIP
+  "Skip PE-baked archive checksum matches (ISAAC_VITA_ARCHIVE_VALIDATION_SKIP)" ON)
+if(ISAAC_ARCHIVE_VALIDATION_SKIP)
+  isaac_generated_owner(sub_00563880 ISAAC_ARCHIVE_VALIDATION_OWNER)
+  set_property(SOURCE ${ISAAC_ARCHIVE_VALIDATION_OWNER}
+    APPEND PROPERTY COMPILE_DEFINITIONS
+      ISAAC_VITA_ARCHIVE_VALIDATION_SKIP=1
+      ISAAC_VITA_ARCHIVE_VALIDATION_SKIP_BUILD_ID=\"linux64\")
+endif()
+
+# Sprite-sheet retention: wrap the ImageManager release observer
+# (0x56d8c0) so a sheet whose last sprite died stays resident on a
+# byte-budgeted LRU; the next Load of the same name (tears, the next room)
+# reuses the uploaded texture instead of re-reading, decoding and uploading.
+option(ISAAC_IMAGE_RETAIN "Retain released sprite sheets (ISAAC_VITA_IMAGE_RETAIN)" ON)
+set(ISAAC_IMAGE_RETAIN_BUDGET_MB 48 CACHE STRING
+  "MiB of retained sprite-sheet texels before the LRU evicts")
+if(ISAAC_IMAGE_RETAIN)
+  list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/host_vita_image_retain.c")
+  set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_image_retain.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS
+      ISAAC_VITA_IMAGE_RETAIN=1
+      ISAAC_VITA_IMAGE_RETAIN_WRAP=1
+      ISAAC_VITA_IMAGE_RETAIN_LAZY_ARM=1
+      ISAAC_VITA_IMAGE_RETAIN_BUDGET_MB=${ISAAC_IMAGE_RETAIN_BUDGET_MB}
+      ISAAC_VITA_IMAGE_RETAIN_HEADROOM_MB=0
+      ISAAC_VITA_IMAGE_RETAIN_BUILD_ID=\"linux64\")
+  list(APPEND ISAAC_WRAP_SYMBOLS sub_0056d8c0)
 endif()
 
 if(ISAAC_ARCHIVE_MINIZ_FASTPATH OR ISAAC_NATIVE_PNG)

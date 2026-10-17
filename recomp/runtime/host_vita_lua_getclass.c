@@ -31,9 +31,9 @@ void isaac_vita_log(const char *format, ...);
 #endif
 
 #define LGC_VA(rva) ((uint32_t)GUEST_IMAGE_BASE + (uint32_t)(rva))
-#define LGC_IDENTITY_KEY ((const void *)(uintptr_t)LGC_VA(ISAAC_LGC_IDENTITY_KEY_RVA))
-#define LGC_STR_CONST    ((const char *)(uintptr_t)LGC_VA(ISAAC_LGC_STR_CONST_RVA))
-#define LGC_STR_PARENT   ((const char *)(uintptr_t)LGC_VA(ISAAC_LGC_STR_PARENT_RVA))
+#define LGC_IDENTITY_KEY ((const void *)guest_ptr(LGC_VA(ISAAC_LGC_IDENTITY_KEY_RVA)))
+#define LGC_STR_CONST    ((const char *)guest_ptr(LGC_VA(ISAAC_LGC_STR_CONST_RVA)))
+#define LGC_STR_PARENT   ((const char *)guest_ptr(LGC_VA(ISAAC_LGC_STR_PARENT_RVA)))
 #define LGC_STATS_PERIOD 0x10000U
 #define LGC_VERIFY_FIRST 64U
 #define LGC_VERIFY_EVERY 4096U
@@ -188,7 +188,7 @@ static int lgc_index(int32_t index)
  * stack for the caller to restore. */
 static uint32_t lgc_prefix(lua_State *L, int top, int idx, uint32_t class_key)
 {
-    lua_rawgetp(L, LUA_REGISTRYINDEX, (const void *)(uintptr_t)class_key);
+    lua_rawgetp(L, LUA_REGISTRYINDEX, (const void *)guest_ptr(class_key));
     if (lua_type(L, top + 1) != LUA_TTABLE)
         return ISAAC_LGC_REASON_CLASS;
     /* Relative indices are evaluated at the same depth as the translated
@@ -220,7 +220,7 @@ int isaac_vita_lua_getclass_try(CPU *__restrict c)
         return lgc_fallback(ISAAC_LGC_FN_GETCLASS, ISAAC_LGC_REASON_STACK);
     if (!lgc_pins_ok())
         return lgc_fallback(ISAAC_LGC_FN_GETCLASS, ISAAC_LGC_REASON_PINS);
-    L = (lua_State *)(uintptr_t)c->ecx;
+    L = (lua_State *)guest_ptr(c->ecx);
     index = (int32_t)c->edx;
     class_key = ld32(c->esp + 4U);
     can_be_const = ld8(c->esp + 8U);   /* cmp byte ptr [ebp + 0xc], 0 */
@@ -267,7 +267,7 @@ int isaac_vita_lua_getclass_try(CPU *__restrict c)
             s_stats.hops += hops;
             if (is_const)
                 ++s_stats.const_objects;
-            lgc_handled(c, ISAAC_LGC_FN_GETCLASS, (uint32_t)(uintptr_t)ud,
+            lgc_handled(c, ISAAC_LGC_FN_GETCLASS, guest_addr(ud),
                         imports);
             return 1;
         }
@@ -311,7 +311,7 @@ int isaac_vita_lua_getexact_try(CPU *__restrict c)
         return lgc_fallback(ISAAC_LGC_FN_GETEXACT, ISAAC_LGC_REASON_STACK);
     if (!lgc_pins_ok())
         return lgc_fallback(ISAAC_LGC_FN_GETEXACT, ISAAC_LGC_REASON_PINS);
-    L = (lua_State *)(uintptr_t)c->ecx;
+    L = (lua_State *)guest_ptr(c->ecx);
     class_key = ld32(c->esp + 4U);
     if (!isaac_vita_lua_seam_enter(c, &root))
         return lgc_fallback(ISAAC_LGC_FN_GETEXACT, ISAAC_LGC_REASON_OWNER);
@@ -335,7 +335,7 @@ int isaac_vita_lua_getexact_try(CPU *__restrict c)
             lua_settop(L, top);
             ud = lua_touserdata(L, 1);
             isaac_vita_lua_seam_leave(c, root);
-            lgc_handled(c, ISAAC_LGC_FN_GETEXACT, (uint32_t)(uintptr_t)ud,
+            lgc_handled(c, ISAAC_LGC_FN_GETEXACT, guest_addr(ud),
                         imports);
             return 1;
         }
@@ -360,7 +360,7 @@ static uint32_t s_verify_hits;
 static void lgc_verify(CPU *__restrict c, unsigned fn, uint32_t entry_esp,
                        uint32_t entry_eax, void (*real)(CPU *__restrict))
 {
-    lua_State *L = (lua_State *)(uintptr_t)c->ecx;
+    lua_State *L = (lua_State *)guest_ptr(c->ecx);
     uint32_t native_eax, native_esp, real_eax, real_esp;
     int native_top, real_top, match;
 

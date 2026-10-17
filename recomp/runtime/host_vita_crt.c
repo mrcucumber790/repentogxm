@@ -1218,8 +1218,9 @@ _Static_assert(ISAAC_VITA_CRT_IO_SHADOW_VARIANT_COUNT == 4U &&
 #endif
 
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE) && \
-    !defined(ISAAC_VITA_CRT_QSORT_HOST_ORACLE)
-/* Vita newlib exposes FOPEN_MAX=20.  One retained archive may coexist with
+    !defined(ISAAC_VITA_CRT_QSORT_HOST_ORACLE) && !defined(__GLIBC__)
+/* glibc's FOPEN_MAX (16) is no limit and is not checked.
+ * Vita newlib exposes FOPEN_MAX=20.  One retained archive may coexist with
  * the three standard streams and all sixteen measured guest FILE tokens, but
  * a second idle slot would silently reduce the guest-visible open capacity.
  * Raw SceIo tokens have no newlib FILE and therefore consume none of these
