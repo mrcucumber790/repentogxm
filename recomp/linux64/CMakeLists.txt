@@ -95,6 +95,26 @@ if(ISAAC_LUA)
   list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/host_vita_lua.c")
 endif()
 
+# Audio: the shared OpenAL adapter (host_vita_audio.c) over system OpenAL
+# Soft.  Only its owners see ISAAC_VITA_AUDIO, as in the Vita target.
+option(ISAAC_AUDIO "OpenAL audio" ON)
+if(ISAAC_AUDIO)
+  if(NOT ISAAC_SDL)
+    message(FATAL_ERROR "ISAAC_AUDIO needs ISAAC_SDL (manual_kage.c)")
+  endif()
+  find_package(OpenAL REQUIRED)
+  list(APPEND ISAAC_RUNTIME_SOURCES
+    "${ISAAC_RUNTIME}/host_vita_audio.c"
+    "${ISAAC_RUNTIME}/host_vita_audio_cooperative.c")
+  set_property(SOURCE
+    "${ISAAC_RUNTIME}/entry_vita.c"
+    "${ISAAC_RUNTIME}/host_vita_first_fault.c"
+    "${ISAAC_RUNTIME}/host_vita_import_id.c"
+    "${ISAAC_RUNTIME}/host_vita_audio_cooperative.c"
+    "${ISAAC_RUNTIME}/manual_kage.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_AUDIO=1)
+endif()
+
 add_executable(isaac-linux64
   ${ISAAC_HOST_SOURCES}
   ${ISAAC_RUNTIME_SOURCES}
@@ -146,4 +166,7 @@ if(ISAAC_SDL)
 endif()
 if(ISAAC_LUA)
   target_link_libraries(isaac-linux64 PRIVATE isaac_lua53)
+endif()
+if(ISAAC_AUDIO)
+  target_link_libraries(isaac-linux64 PRIVATE OpenAL::OpenAL)
 endif()

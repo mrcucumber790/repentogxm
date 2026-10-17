@@ -1,5 +1,6 @@
 /* Direct frozen-x86 OpenAL ABI adapters for Vita OpenAL Soft. */
 #include <stddef.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -201,7 +202,7 @@ _Static_assert(sizeof s_vita_audio_argument_counts /
      s_vita_audio_owner.context)
 
 #if defined(__vita__)
-_Static_assert(sizeof(void *) == 4U,
+_Static_assert(sizeof(void *) == 4U || GUEST_MEM_WINDOW,
                "guest/native OpenAL pointer seam requires a 32-bit Vita ABI");
 #endif
 _Static_assert(sizeof(ALuint) == 4U && sizeof(ALint) == 4U &&
@@ -353,8 +354,78 @@ static float vita_audio_float_arg(CPU *__restrict c, uint32_t index)
 
 static void *vita_audio_pointer_arg(CPU *__restrict c, uint32_t index)
 {
-    return (void *)(uintptr_t)vita_audio_arg(c, index);
+    return guest_ptr(vita_audio_arg(c, index));
 }
+
+#if GUEST_MEM_WINDOW
+/* Native ALCdevice/ALCcontext pointers do not fit the 32-bit guest ABI on a
+ * 64-bit host.  The guest only stores and passes them back, so it receives a
+ * stable token instead: the guest address of a slot in a window-resident
+ * array whose index names the native handle. */
+#define VITA_AUDIO_HANDLE_SLOTS 8U
+static void *s_vita_audio_handles[VITA_AUDIO_HANDLE_SLOTS];
+static uint32_t s_vita_audio_handle_base;
+
+static uint32_t vita_audio_handle_token(const void *pointer)
+{
+    uint32_t i;
+    uint32_t free_slot = VITA_AUDIO_HANDLE_SLOTS;
+
+    if (!pointer)
+        return 0U;
+    if (!s_vita_audio_handle_base) {
+        void *slots = calloc(VITA_AUDIO_HANDLE_SLOTS, 4U);
+
+        if (!slots)
+            return 0U;
+        s_vita_audio_handle_base = guest_addr(slots);
+    }
+    for (i = 0U; i < VITA_AUDIO_HANDLE_SLOTS; ++i) {
+        if (s_vita_audio_handles[i] == pointer)
+            return s_vita_audio_handle_base + i * 4U;
+        if (!s_vita_audio_handles[i] && free_slot == VITA_AUDIO_HANDLE_SLOTS)
+            free_slot = i;
+    }
+    if (free_slot == VITA_AUDIO_HANDLE_SLOTS)
+        return 0U;
+    s_vita_audio_handles[free_slot] = (void *)pointer;
+    return s_vita_audio_handle_base + free_slot * 4U;
+}
+
+static void *vita_audio_handle_lookup(uint32_t token)
+{
+    uint32_t offset = token - s_vita_audio_handle_base;
+
+    if (!token || !s_vita_audio_handle_base || (offset & 3U) ||
+            offset / 4U >= VITA_AUDIO_HANDLE_SLOTS)
+        return NULL;
+    return s_vita_audio_handles[offset / 4U];
+}
+
+static void vita_audio_handle_forget(const void *pointer)
+{
+    uint32_t i;
+
+    for (i = 0U; pointer && i < VITA_AUDIO_HANDLE_SLOTS; ++i)
+        if (s_vita_audio_handles[i] == pointer)
+            s_vita_audio_handles[i] = NULL;
+}
+
+static void *vita_audio_handle_arg(CPU *__restrict c, uint32_t index)
+{
+    return vita_audio_handle_lookup(vita_audio_arg(c, index));
+}
+#else
+static void *vita_audio_handle_arg(CPU *__restrict c, uint32_t index)
+{
+    return vita_audio_pointer_arg(c, index);
+}
+
+static void vita_audio_handle_forget(const void *pointer)
+{
+    (void)pointer;
+}
+#endif
 
 static void vita_audio_cdecl_return(CPU *__restrict c)
 {
@@ -364,6 +435,13 @@ static void vita_audio_cdecl_return(CPU *__restrict c)
 static uint32_t vita_audio_native_pointer(CPU *__restrict c,
                                           const void *pointer)
 {
+#if GUEST_MEM_WINDOW
+    uint32_t token = vita_audio_handle_token(pointer);
+
+    if (pointer && !token)
+        guest_fault(c, 0U, "native OpenAL handle table exhausted");
+    return token;
+#else
     uintptr_t value = (uintptr_t)pointer;
 
     if (value > UINT32_MAX) {
@@ -372,17 +450,23 @@ static uint32_t vita_audio_native_pointer(CPU *__restrict c,
         return 0U;
     }
     return (uint32_t)value;
+#endif
 }
 
 static int vita_audio_manager_pointer(const void *pointer,
                                       uint32_t *guest_pointer)
 {
+#if GUEST_MEM_WINDOW
+    *guest_pointer = vita_audio_handle_token(pointer);
+    return *guest_pointer != 0U;
+#else
     uintptr_t value = (uintptr_t)pointer;
 
     if (value > UINT32_MAX)
         return 0;
     *guest_pointer = (uint32_t)value;
     return 1;
+#endif
 }
 
 static int vita_audio_device_has_required_sources(ALCdevice *device)
@@ -398,8 +482,14 @@ static int vita_audio_device_has_required_sources(ALCdevice *device)
     alcGetIntegerv(device, ALC_STEREO_SOURCES, 1, &stereo_sources);
     if (mono_sources < 0 || stereo_sources < 0)
         return 0;
+#if GUEST_MEM_WINDOW
+    /* Stock OpenAL Soft on a desktop/Switch host: only the floor matters. */
+    return (uint32_t)mono_sources + (uint32_t)stereo_sources >=
+           ISAAC_VITA_AUDIO_DEVICE_SOURCE_COUNT;
+#else
     return (uint32_t)mono_sources + (uint32_t)stereo_sources ==
            ISAAC_VITA_AUDIO_DEVICE_SOURCE_COUNT;
+#endif
 }
 
 static void vita_audio_manager_zero_names(uint32_t manager)
@@ -468,19 +558,18 @@ static void vita_audio_manager_release(uint32_t manager)
         if (s_vita_audio_owner.sources_live) {
             alDeleteSources(
                 (ALsizei)ISAAC_VITA_AUDIO_MANAGER_SOURCE_COUNT,
-                (const ALuint *)(uintptr_t)(
-                    manager + ISAAC_VITA_AUDIO_MANAGER_SOURCES_OFFSET));
+                (const ALuint *)guest_ptr(manager + ISAAC_VITA_AUDIO_MANAGER_SOURCES_OFFSET));
             s_vita_audio_owner.sources_live = 0U;
         }
         if (s_vita_audio_owner.buffers_live) {
             alDeleteBuffers(
                 (ALsizei)ISAAC_VITA_AUDIO_MANAGER_BUFFER_COUNT,
-                (const ALuint *)(uintptr_t)(
-                    manager + ISAAC_VITA_AUDIO_MANAGER_BUFFERS_OFFSET));
+                (const ALuint *)guest_ptr(manager + ISAAC_VITA_AUDIO_MANAGER_BUFFERS_OFFSET));
             s_vita_audio_owner.buffers_live = 0U;
         }
         (void)alcMakeContextCurrent(NULL);
         alcDestroyContext(context);
+        vita_audio_handle_forget(context);
         s_vita_audio_owner.context = NULL;
         st32(manager + ISAAC_VITA_AUDIO_MANAGER_CONTEXT_OFFSET, 0U);
     } else {
@@ -491,6 +580,7 @@ static void vita_audio_manager_release(uint32_t manager)
     vita_audio_manager_zero_names(manager);
     device = s_vita_audio_owner.device;
     if (device && alcCloseDevice(device)) {
+        vita_audio_handle_forget(device);
         s_vita_audio_owner.device = NULL;
         st32(manager + ISAAC_VITA_AUDIO_MANAGER_DEVICE_OFFSET, 0U);
     }
@@ -566,12 +656,12 @@ int isaac_vita_audio_manager_initialize(uint32_t manager,
     alcProcessContext(context);
     alGenSources(
         (ALsizei)ISAAC_VITA_AUDIO_MANAGER_SOURCE_COUNT,
-        (ALuint *)(uintptr_t)(manager +
+        (ALuint *)guest_ptr(manager +
                               ISAAC_VITA_AUDIO_MANAGER_SOURCES_OFFSET));
     s_vita_audio_owner.sources_live = 1U;
     alGenBuffers(
         (ALsizei)ISAAC_VITA_AUDIO_MANAGER_BUFFER_COUNT,
-        (ALuint *)(uintptr_t)(manager +
+        (ALuint *)guest_ptr(manager +
                               ISAAC_VITA_AUDIO_MANAGER_BUFFERS_OFFSET));
     s_vita_audio_owner.buffers_live = 1U;
     alListener3f(AL_POSITION, 0.0f, 0.0f, 0.0f);
@@ -767,15 +857,16 @@ static void vita_audio_source_unqueue_buffers(CPU *__restrict c)
 static void vita_audio_make_context_current(CPU *__restrict c)
 {
     c->eax = (uint32_t)alcMakeContextCurrent(
-        (ALCcontext *)vita_audio_pointer_arg(c, 0U));
+        (ALCcontext *)vita_audio_handle_arg(c, 0U));
     vita_audio_cdecl_return(c);
 }
 
 static void vita_audio_destroy_context(CPU *__restrict c)
 {
-    ALCcontext *context = (ALCcontext *)vita_audio_pointer_arg(c, 0U);
+    ALCcontext *context = (ALCcontext *)vita_audio_handle_arg(c, 0U);
 
     alcDestroyContext(context);
+    vita_audio_handle_forget(context);
     vita_audio_owner_context_destroyed(context);
     vita_audio_cdecl_return(c);
 }
@@ -793,7 +884,7 @@ static void vita_audio_open_device(CPU *__restrict c)
 static void vita_audio_create_context(CPU *__restrict c)
 {
     ALCcontext *context = alcCreateContext(
-        (ALCdevice *)vita_audio_pointer_arg(c, 0U),
+        (ALCdevice *)vita_audio_handle_arg(c, 0U),
         (const ALCint *)vita_audio_pointer_arg(c, 1U));
 
     c->eax = vita_audio_native_pointer(c, context);
@@ -803,12 +894,14 @@ static void vita_audio_create_context(CPU *__restrict c)
 
 static void vita_audio_close_device(CPU *__restrict c)
 {
-    ALCdevice *device = (ALCdevice *)vita_audio_pointer_arg(c, 0U);
+    ALCdevice *device = (ALCdevice *)vita_audio_handle_arg(c, 0U);
     ALCboolean closed = alcCloseDevice(device);
 
     c->eax = (uint32_t)closed;
-    if (closed)
+    if (closed) {
+        vita_audio_handle_forget(device);
         vita_audio_owner_device_closed(device);
+    }
     vita_audio_cdecl_return(c);
 }
 
@@ -831,7 +924,7 @@ static void vita_audio_source_i(CPU *__restrict c)
 
 static void vita_audio_process_context(CPU *__restrict c)
 {
-    alcProcessContext((ALCcontext *)vita_audio_pointer_arg(c, 0U));
+    alcProcessContext((ALCcontext *)vita_audio_handle_arg(c, 0U));
     vita_audio_cdecl_return(c);
 }
 
