@@ -132,6 +132,35 @@ typedef struct guest_jump_site {
     uint32_t guest_registration;
 } guest_jump_site;
 
+/* MSVC x86 C++ exception handling (GUEST_CXX_EH=1, guest_cxx_eh.c).  A catch
+ * resumes at a continuation inside the generated C activation of the
+ * function that owns the catching frame, so that activation registers a
+ * native landing site at its `push __ehhandler$F` prologue instruction
+ * (GUEST_CXX_EH=1 corpora only, recomp/cxx_eh.py).  The record is automatic
+ * storage of the generated body; GUEST_EH_SITE_CLEANUP unlinks it on every C
+ * return, and the runtime prunes records of activations it abandons. */
+#ifndef GUEST_CXX_EH
+#define GUEST_CXX_EH 0
+#endif
+#if GUEST_CXX_EH
+struct CPU;
+typedef struct guest_eh_site {
+    jmp_buf native_env;
+    struct guest_eh_site *previous;
+    struct CPU *cpu;
+    uint32_t registration;  /* guest EH registration node (EBP-0Ch) */
+    uint32_t handler;       /* its __ehhandler$ thunk VA */
+    uint32_t continuation;  /* written by the runtime before longjmp */
+    uint32_t active;
+} guest_eh_site;
+void guest_eh_frame_cleanup(guest_eh_site *site);
+#if defined(__GNUC__) || defined(__clang__)
+#define GUEST_EH_SITE_CLEANUP __attribute__((cleanup(guest_eh_frame_cleanup)))
+#else
+#error "GUEST_CXX_EH needs a compiler with __attribute__((cleanup))"
+#endif
+#endif
+
 /* Which operation last wrote the flags. The consumer needs this to know how
  * to derive CF and OF, which are the only two that are not a pure function
  * of the result. */
@@ -241,6 +270,13 @@ typedef struct CPU {
      * exact native destination for a later guest `longjmp`. */
     guest_jump_site *jump_sites;
     uint32_t         jump_value;
+
+#if GUEST_CXX_EH
+    /* Live C++ EH landing sites (innermost first) and the exceptions whose
+     * catch funclets are running (guest_cxx_eh.c private records). */
+    guest_eh_site   *eh_sites;
+    void            *eh_handling;
+#endif
 
     /* Synthetic-stack ownership is deliberately per CPU.  stack_owner is a
      * host identity token, never a guest pointer: copying a CPU leaves the
@@ -1664,6 +1700,20 @@ void guest_setjmp_leave(CPU *__restrict c, guest_jump_site *site);
 #endif
 GUEST_NORETURN void guest_longjmp(CPU *__restrict c, uint32_t guest_env,
                                   int32_t value);
+
+#if GUEST_CXX_EH
+/* Generated at an owner's `push __ehhandler$F`: RN is the next push slot. */
+void guest_eh_frame_enter(CPU *__restrict c, guest_eh_site *site,
+                          uint32_t handler);
+/* A native nonlocal transfer (guest longjmp, a Lua error escape) that leaves
+ * the guest stack at `guest_esp` abandoned every generated activation whose
+ * EH frame lies below it: drop their landing sites and pending catches before
+ * any new site can be linked over the dead native frames. */
+void guest_eh_prune(CPU *__restrict c, uint32_t guest_esp);
+/* Unresolved-import hook: the VCRUNTIME C++ EH entry points.  Returns 1 when
+ * handled (or never returns), 0 for any other import. */
+int guest_cxx_eh_import(CPU *__restrict c, uint32_t addr, const char *name);
+#endif
 
 enum {
     GUEST_RUN_INVALID  = -1,

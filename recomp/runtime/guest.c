@@ -1258,6 +1258,10 @@ int guest_stack_init(CPU *c)
     c->run_scope = NULL;
     c->jump_sites = NULL;
     c->jump_value = 0U;
+#if GUEST_CXX_EH
+    c->eh_sites = NULL;
+    c->eh_handling = NULL;
+#endif
     g_stack_mem = p;
     g_stack_owner = c;
     g_stack_base = c->stack_floor;
@@ -1290,6 +1294,10 @@ void guest_stack_free(CPU *c)
         c->esp = c->ebp = 0;
         c->jump_sites = NULL;
         c->jump_value = 0U;
+#if GUEST_CXX_EH
+        c->eh_sites = NULL;
+        c->eh_handling = NULL;
+#endif
         c->stack_owner = NULL;
         c->stack_floor = 0U;
         c->stack_ceiling = 0U;
@@ -2522,6 +2530,12 @@ generic_import_id_dispatch:
         if (guest_host_import(c, imported->name))
             return;
 #endif
+#if GUEST_CXX_EH
+        /* The VCRUNTIME C++ EH rows stay unresolved in the frozen Vita
+         * import-ID map; this build implements them in guest_cxx_eh.c. */
+        if (guest_cxx_eh_import(c, addr, imported->name))
+            return;
+#endif
         guest_fault(c, addr, imported->name);
         return;
     }
@@ -2827,6 +2841,10 @@ GUEST_NORETURN void guest_longjmp(CPU *__restrict c, uint32_t guest_env,
         abort();
     c->jump_value = value ? (uint32_t)value : 1U;
     c->jump_sites = site;       /* records above the target are now stale */
+#if GUEST_CXX_EH
+    /* C++ EH landing sites of the abandoned activations are stale too. */
+    guest_eh_prune(c, site->guest_esp);
+#endif
     longjmp(site->native_env, 1);
 }
 
@@ -2899,6 +2917,10 @@ int guest_run_until_stop(CPU *__restrict c, guest_fn entry)
      * remains available for diagnostics. */
     c->jump_sites = NULL;
     c->jump_value = 0U;
+#if GUEST_CXX_EH
+    c->eh_sites = NULL;
+    c->eh_handling = NULL;
+#endif
 #if defined(ISAAC_VITA_LUA) && ISAAC_VITA_LUA
     /* guest_fault/guest_exit longjmp over native Lua and translated callback
      * activations.  Drop their process-local ownership before this CPU can be

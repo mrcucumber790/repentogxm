@@ -146,6 +146,12 @@ typedef struct vita_lua_callback_frame {
     /* g_kage_guest_last_indirect_target when this callback was entered. */
     uint32_t sampler_enclosing_target;
 #endif
+#if GUEST_CXX_EH
+    /* Guest fs:[0] at entry.  A Lua error escape abandons the callback's
+     * guest frames without their epilogues; like MSVC longjmp, put the
+     * registration chain back so no dead EH frame stays linked. */
+    uint32_t saved_fs0;
+#endif
 } vita_lua_callback_frame;
 
 typedef struct vita_lua_require_frame {
@@ -372,6 +378,9 @@ static void vita_lua_restore_callback_cpu(vita_lua_callback_frame *frame)
 {
     CPU *c = frame->cpu;
     (void)guest_stack_set(c, frame->saved_esp, 0U);
+#if GUEST_CXX_EH
+    st32(guest_fs_base(c), frame->saved_fs0);
+#endif
     c->ebx = frame->saved_ebx;
     c->ebp = frame->saved_ebp;
     c->esi = frame->saved_esi;
@@ -415,6 +424,9 @@ static int vita_lua_callback_frame_push(CPU *c, lua_State *state)
             frame->saved_ebp = c->ebp;
             frame->saved_esi = c->esi;
             frame->saved_edi = c->edi;
+#if GUEST_CXX_EH
+            frame->saved_fs0 = ld32(guest_fs_base(c));
+#endif
             frame->previous = s_vita_lua_callback_top;
             s_vita_lua_callback_top = (int)i;
             return (int)i;
@@ -462,8 +474,29 @@ static int vita_lua_recover_callbacks(CPU *c, int entry_mark)
         recovered = 1;
     }
     (void)recovered;
+#if GUEST_CXX_EH
+    /* Every guest activation below the restored (or unchanged import) ESP
+     * was abandoned by Lua's longjmp: drop its C++ EH landing sites. */
+    guest_eh_prune(c, c->esp);
+#endif
     return 1;
 }
+
+#if GUEST_CXX_EH
+/* guest_cxx_eh.c: a guest catch must not resume above the innermost native
+ * callback trampoline of this CPU (native Lua frames lie between). */
+uint32_t isaac_vita_lua_callback_boundary_esp(CPU *c)
+{
+    int slot = s_vita_lua_callback_top;
+    const vita_lua_callback_frame *frame;
+    if (slot < 0 || (uint32_t)slot >= VITA_LUA_MAX_CALLBACK_DEPTH)
+        return 0U;
+    frame = &s_vita_lua_callbacks[slot];
+    if (!frame->used || frame->cpu != c)
+        return 0U;
+    return frame->saved_esp;
+}
+#endif
 
 static void vita_lua_copy_error_text(char output[VITA_LUA_ERROR_TEXT_MAX + 1U],
                                      uint32_t guest_text)
@@ -993,6 +1026,11 @@ static int vita_lua_call_guest(lua_State *state, uint32_t target)
         }
 #endif
     }
+#if GUEST_CXX_EH
+    /* After an escape longjmp the activations below the callback boundary
+     * are gone; on a normal return this finds nothing to drop. */
+    guest_eh_prune(c, c->esp);
+#endif
 #if defined(ISAAC_VITA_DEEP_PROFILE)
     kage_vita_deep_unwind(deep_callback_mark);
 #endif
