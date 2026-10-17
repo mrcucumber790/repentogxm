@@ -1038,6 +1038,10 @@ int isaac_vita_crt_log_batch_get_snapshot(
  * `exit` uses this after TLS/atexit callbacks; `_exit` deliberately does not.
  * Returns zero on success and EOF on a native flush failure. */
 int isaac_vita_crt_flush_all(void);
+#if defined(__SWITCH__)
+/* Write out the game's buffered log.txt (its own flushes are dropped). */
+void isaac_vita_crt_flush_game_log(void);
+#endif
 
 #if defined(ISAAC_VITA_IO_PROFILE)
 /* Startup-only logical stdio telemetry.  Physical sceIoRead/sceIoLseek

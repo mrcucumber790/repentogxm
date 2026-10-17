@@ -17,6 +17,10 @@ extern "C" {
 
 void isaac_vita_log_reset(void);
 void isaac_vita_log(const char *format, ...);
+#if defined(__SWITCH__)
+void isaac_vita_log_set_buffered(int buffered);
+void isaac_vita_log_flush(void);
+#endif
 
 #ifdef __cplusplus
 }

@@ -259,8 +259,13 @@ int sceClibPrintf(const char *fmt, ...)
 
 /* ------------------------------------------------------ process/thread */
 
+void isaac_vita_crt_async_write_shutdown(void) __attribute__((weak));
+
 int sceKernelExitProcess(int res)
 {
+    /* Queued save images must reach the card before the process ends. */
+    if (isaac_vita_crt_async_write_shutdown)
+        isaac_vita_crt_async_write_shutdown();
     fflush(NULL);
     _exit(res);
 }
@@ -302,6 +307,185 @@ static evf *evf_of(int id)
 {
     int i = id - EVF_ID_BASE;
     return (i >= 0 && i < EVF_SLOTS && s_evf[i].used) ? &s_evf[i] : NULL;
+}
+
+/* ---------------------------------------------- semaphores and threads */
+
+#define SEMA_SLOTS 16
+#define SEMA_ID_BASE 0x51000000
+#define THREAD_SLOTS 16
+#define THREAD_ID_BASE 0x52000000
+
+typedef struct {
+    int used;
+    int count, max;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+} sema;
+
+typedef struct {
+    int used, started;
+    SceKernelThreadEntry entry;
+    SceSize stack_size, arglen;
+    void *argp;
+    int status;
+    pthread_t thread;
+} kthread;
+
+static pthread_mutex_t s_obj_table = PTHREAD_MUTEX_INITIALIZER;
+static sema s_sema[SEMA_SLOTS];
+static kthread s_thread[THREAD_SLOTS];
+
+static sema *sema_of(SceUID id)
+{
+    int i = id - SEMA_ID_BASE;
+    return (i >= 0 && i < SEMA_SLOTS && s_sema[i].used) ? &s_sema[i] : NULL;
+}
+
+static kthread *thread_of(SceUID id)
+{
+    int i = id - THREAD_ID_BASE;
+    return (i >= 0 && i < THREAD_SLOTS && s_thread[i].used) ? &s_thread[i]
+                                                           : NULL;
+}
+
+SceUID sceKernelCreateSema(const char *name, SceUInt attr, int init_val,
+                           int max_val, void *opt)
+{
+    int i;
+    (void)name; (void)attr; (void)opt;
+    pthread_mutex_lock(&s_obj_table);
+    for (i = 0; i < SEMA_SLOTS; i++) {
+        if (!s_sema[i].used) {
+            s_sema[i].used = 1;
+            s_sema[i].count = init_val;
+            s_sema[i].max = max_val;
+            pthread_mutex_init(&s_sema[i].lock, NULL);
+            pthread_cond_init(&s_sema[i].cond, NULL);
+            pthread_mutex_unlock(&s_obj_table);
+            return SEMA_ID_BASE + i;
+        }
+    }
+    pthread_mutex_unlock(&s_obj_table);
+    return (int)0x8002801a;
+}
+
+int sceKernelDeleteSema(SceUID id)
+{
+    sema *e = sema_of(id);
+    if (!e)
+        return (int)0x800281a0;
+    pthread_mutex_lock(&s_obj_table);
+    pthread_cond_destroy(&e->cond);
+    pthread_mutex_destroy(&e->lock);
+    e->used = 0;
+    pthread_mutex_unlock(&s_obj_table);
+    return 0;
+}
+
+int sceKernelSignalSema(SceUID id, int signal)
+{
+    sema *e = sema_of(id);
+    if (!e)
+        return (int)0x800281a0;
+    pthread_mutex_lock(&e->lock);
+    e->count += signal;
+    if (e->max > 0 && e->count > e->max)
+        e->count = e->max;
+    pthread_cond_broadcast(&e->cond);
+    pthread_mutex_unlock(&e->lock);
+    return 0;
+}
+
+int sceKernelWaitSema(SceUID id, int signal, SceUInt *timeout)
+{
+    sema *e = sema_of(id);
+    (void)timeout; /* the save writer waits without one */
+    if (!e)
+        return (int)0x800281a0;
+    pthread_mutex_lock(&e->lock);
+    while (e->count < signal)
+        pthread_cond_wait(&e->cond, &e->lock);
+    e->count -= signal;
+    pthread_mutex_unlock(&e->lock);
+    return 0;
+}
+
+SceUID sceKernelCreateThread(const char *name, SceKernelThreadEntry entry,
+                             int init_priority, SceSize stack_size,
+                             SceUInt attr, int cpu_affinity_mask,
+                             const void *opt)
+{
+    int i;
+    (void)name; (void)init_priority; (void)attr; (void)cpu_affinity_mask;
+    (void)opt;
+    if (!entry)
+        return (int)0x80020000;
+    pthread_mutex_lock(&s_obj_table);
+    for (i = 0; i < THREAD_SLOTS; i++) {
+        if (!s_thread[i].used) {
+            memset(&s_thread[i], 0, sizeof s_thread[i]);
+            s_thread[i].used = 1;
+            s_thread[i].entry = entry;
+            s_thread[i].stack_size = stack_size;
+            pthread_mutex_unlock(&s_obj_table);
+            return THREAD_ID_BASE + i;
+        }
+    }
+    pthread_mutex_unlock(&s_obj_table);
+    return (int)0x8002801a;
+}
+
+static void *kthread_main(void *arg)
+{
+    kthread *t = arg;
+    t->status = t->entry(t->arglen, t->argp);
+    return NULL;
+}
+
+int sceKernelStartThread(SceUID id, SceSize arglen, void *argp)
+{
+    kthread *t = thread_of(id);
+    pthread_attr_t attr;
+    int rc;
+    if (!t || t->started)
+        return (int)0x800201a0;
+    t->arglen = arglen;
+    t->argp = argp;
+    pthread_attr_init(&attr);
+    if (t->stack_size)
+        pthread_attr_setstacksize(&attr, t->stack_size < 64u * 1024u
+                                             ? 64u * 1024u : t->stack_size);
+    rc = pthread_create(&t->thread, &attr, kthread_main, t);
+    pthread_attr_destroy(&attr);
+    if (rc != 0)
+        return (int)0x80020000;
+    t->started = 1;
+    return 0;
+}
+
+int sceKernelWaitThreadEnd(SceUID id, int *stat, SceUInt *timeout)
+{
+    kthread *t = thread_of(id);
+    (void)timeout;
+    if (!t || !t->started)
+        return (int)0x800201a0;
+    pthread_join(t->thread, NULL);
+    t->started = 0;
+    if (stat)
+        *stat = t->status;
+    return 0;
+}
+
+int sceKernelDeleteThread(SceUID id)
+{
+    kthread *t = thread_of(id);
+    if (!t)
+        return (int)0x800201a0;
+    if (t->started)
+        return (int)0x800201a0; /* still running */
+    t->used = 0;
+    return 0;
 }
 
 SceUID sceKernelCreateEventFlag(const char *name, int attr, int bits,

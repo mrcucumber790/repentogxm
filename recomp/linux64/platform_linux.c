@@ -31,6 +31,47 @@ static uint64_t now_us(void)
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
 
+#if defined(__SWITCH__)
+/* On the SD card every open/write/close is a synchronous stall of several
+ * milliseconds, which showed up as frame drops whenever a burst of lines was
+ * logged in a run.  Keep the file open; once the game runs steadily the SDL
+ * backend switches to a buffered log flushed every few seconds. */
+static FILE *s_log_file;
+static int s_log_buffered;
+
+static void log_write(const char *line, unsigned int size)
+{
+    pthread_mutex_lock(&s_log_lock);
+    if (!s_log_file) {
+        s_log_file = fopen(ISAAC_LOG_PATH, "ab");
+        if (s_log_file)
+            setvbuf(s_log_file, NULL, _IOFBF, 64u * 1024u);
+    }
+    if (s_log_file) {
+        fwrite(line, 1, size, s_log_file);
+        if (!s_log_buffered)
+            fflush(s_log_file);
+    }
+    pthread_mutex_unlock(&s_log_lock);
+}
+
+void isaac_vita_log_set_buffered(int buffered)
+{
+    pthread_mutex_lock(&s_log_lock);
+    s_log_buffered = buffered != 0;
+    if (s_log_file)
+        fflush(s_log_file);
+    pthread_mutex_unlock(&s_log_lock);
+}
+
+void isaac_vita_log_flush(void)
+{
+    pthread_mutex_lock(&s_log_lock);
+    if (s_log_file)
+        fflush(s_log_file);
+    pthread_mutex_unlock(&s_log_lock);
+}
+#else
 static void log_write(const char *line, unsigned int size)
 {
     FILE *f;
@@ -43,6 +84,7 @@ static void log_write(const char *line, unsigned int size)
     }
     pthread_mutex_unlock(&s_log_lock);
 }
+#endif
 
 void isaac_vita_log_sink_file(const char *line, unsigned int size)
 {

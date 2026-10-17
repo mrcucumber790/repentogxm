@@ -134,6 +134,22 @@ int sceKernelClearEventFlag(SceUID evid, unsigned int bits);
 int sceKernelWaitEventFlag(int evid, unsigned int bits, unsigned int wait,
                            unsigned int *outBits, SceUInt *timeout);
 
+/* Minimal semaphores and threads (the asynchronous save writer). */
+typedef int (*SceKernelThreadEntry)(SceSize args, void *argp);
+#define SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT 0
+SceUID sceKernelCreateSema(const char *name, SceUInt attr, int init_val,
+                           int max_val, void *opt);
+int sceKernelDeleteSema(SceUID semaid);
+int sceKernelSignalSema(SceUID semaid, int signal);
+int sceKernelWaitSema(SceUID semaid, int signal, SceUInt *timeout);
+SceUID sceKernelCreateThread(const char *name, SceKernelThreadEntry entry,
+                             int init_priority, SceSize stack_size,
+                             SceUInt attr, int cpu_affinity_mask,
+                             const void *opt);
+int sceKernelStartThread(SceUID thid, SceSize arglen, void *argp);
+int sceKernelWaitThreadEnd(SceUID thid, int *stat, SceUInt *timeout);
+int sceKernelDeleteThread(SceUID thid);
+
 /* sysmem */
 SceUID sceKernelAllocMemBlock(const char *name, SceKernelMemBlockType type,
                               SceSize size, SceKernelAllocMemBlockOpt *opt);

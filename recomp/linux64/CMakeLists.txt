@@ -358,6 +358,29 @@ if(ISAAC_CRT_SEEK_SHADOW)
     APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_CRT_SEEK_SHADOW=1)
 endif()
 
+# The game rewrites gamestateN.dat (~68 KB) on every room change through a
+# 1 KiB-buffered FILE: dozens of synchronous writes plus open/truncate/close
+# inside Game::Update, a visible hitch on an SD card.  Hand whole save images
+# to one writer thread instead (ISAAC_VITA_ASYNC_SAVE_WRITE).
+option(ISAAC_ASYNC_SAVE_WRITE
+  "Write Documents/*.dat saves from a worker thread (ISAAC_VITA_ASYNC_SAVE_WRITE)" ON)
+if(ISAAC_ASYNC_SAVE_WRITE AND NOT ISAAC_ARCHIVE_FILE_CACHE)
+  message(FATAL_ERROR "ISAAC_ASYNC_SAVE_WRITE requires ISAAC_ARCHIVE_FILE_CACHE")
+endif()
+if(ISAAC_ASYNC_SAVE_WRITE)
+  list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/host_vita_async_write.c")
+  set_property(SOURCE
+    "${ISAAC_RUNTIME}/host_vita_crt.c"
+    "${ISAAC_RUNTIME}/host_vita_filesystem.c"
+    "${ISAAC_RUNTIME}/host_vita_startup.c"
+    "${ISAAC_RUNTIME}/host_vita_find.c"
+    "${ISAAC_RUNTIME}/host_vita_async_write.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_ASYNC_SAVE_WRITE=1)
+  set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_async_write.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS
+      ISAAC_VITA_ASYNC_WRITE_BUILD_ID=\"linux64\")
+endif()
+
 # libpng chunk CRC-32 byte loop (0x5c3320) natively, behind its generated
 # entry seam.
 option(ISAAC_PNG_CRC32_FASTPATH

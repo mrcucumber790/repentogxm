@@ -919,6 +919,9 @@ enum {
 #endif
 
 static volatile uint32_t s_file_lock;
+#if defined(__SWITCH__)
+static FILE *s_switch_game_log;
+#endif
 #if defined(ISAAC_VITA_GAME_LOG_BATCH)
 static isaac_vita_crt_log_batch_snapshot s_log_batch = {
     ISAAC_VITA_CRT_LOG_BATCH_ABI, 1U,
@@ -3366,6 +3369,19 @@ void isaac_vita_crt_archive_diag_dump(void)
 #endif
 }
 
+#if defined(__SWITCH__)
+void isaac_vita_crt_flush_game_log(void)
+{
+    int saved_errno = errno;
+
+    vita_crt_file_lock();
+    if (s_switch_game_log)
+        (void)fflush(s_switch_game_log);
+    vita_crt_file_unlock();
+    errno = saved_errno;
+}
+#endif
+
 int isaac_vita_crt_flush_all(void)
 {
     int result;
@@ -3786,12 +3802,17 @@ static void vita_crt_fopen(CPU *__restrict c)
     }
 #endif
 #if defined(__SWITCH__)
-    /* The game never flushes log.txt and a Switch app is usually closed from
-     * HOME, which drops stdio buffers: keep the log line buffered. */
+    /* The game flushes log.txt after every record, and each flush is a
+     * synchronous SD card write that stalls the frame (room transitions log
+     * dozens of lines).  Buffer it fully and drop the game's own flushes;
+     * the SDL backend flushes it every few seconds instead
+     * (isaac_vita_crt_flush_game_log), so a HOME close loses only the tail. */
     if (stream) {
         size_t length = strlen(native_path);
-        if (length >= 7U && !strcmp(native_path + length - 7U, "log.txt"))
-            setvbuf(stream, NULL, _IOLBF, BUFSIZ);
+        if (length >= 7U && !strcmp(native_path + length - 7U, "log.txt")) {
+            setvbuf(stream, NULL, _IOFBF, 64U * 1024U);
+            s_switch_game_log = stream;
+        }
     }
 #endif
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
@@ -4110,6 +4131,10 @@ static void vita_crt_fclose(CPU *__restrict c)
         vita_crt_profile_add(&s_io_profile.fclose_calls, 1U);
 #endif
     errno = 0;
+#if defined(__SWITCH__)
+    if (stream == s_switch_game_log)
+        s_switch_game_log = NULL;
+#endif
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
 #if defined(ISAAC_VITA_IO_PROFILE)
     closing_shadow = s_file_tokens[index].io_shadow;
@@ -4831,6 +4856,15 @@ static void vita_crt_fflush(CPU *__restrict c)
         return;
     }
     tracked = vita_crt_log_batch_tracks_flush_locked(token, exact_logger);
+#endif
+#if defined(__SWITCH__)
+    if (stream && stream == s_switch_game_log) {
+        vita_crt_file_unlock();
+        errno = saved_errno;
+        c->eax = 0U;
+        vita_crt_cdecl_return(c);
+        return;
+    }
 #endif
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
     if (!token || index < 0 || !s_file_tokens[index].seek_shadow.read_only)
