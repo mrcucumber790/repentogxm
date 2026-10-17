@@ -68,10 +68,41 @@ SceSSize sceIoWrite(SceUID fd, const void *buf, SceSize nbyte)
     return r < 0 ? sce_errno() : r;
 }
 
+#if defined(__SWITCH__)
+/* newlib on libnx has no pread(): seek, read and restore the position under
+ * one lock so concurrent positional reads cannot interleave. */
+static pthread_mutex_t s_pread_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 int sceIoPread(SceUID fd, void *data, SceSize size, SceOff offset)
 {
+#if defined(__SWITCH__)
+    ssize_t r;
+    off_t saved;
+    pthread_mutex_lock(&s_pread_lock);
+    saved = lseek(fd, 0, SEEK_CUR);
+    if (saved < 0 || lseek(fd, (off_t)offset, SEEK_SET) < 0) {
+        int err = sce_errno();
+        pthread_mutex_unlock(&s_pread_lock);
+        return err;
+    }
+    r = read(fd, data, size);
+    {
+        int read_errno = errno;
+        lseek(fd, saved, SEEK_SET);
+        errno = read_errno;
+    }
+    if (r < 0) {
+        int err = sce_errno();
+        pthread_mutex_unlock(&s_pread_lock);
+        return err;
+    }
+    pthread_mutex_unlock(&s_pread_lock);
+    return (int)r;
+#else
     ssize_t r = pread(fd, data, size, (off_t)offset);
     return r < 0 ? sce_errno() : (int)r;
+#endif
 }
 
 SceOff sceIoLseek(SceUID fd, SceOff offset, int whence)
