@@ -155,6 +155,20 @@ if(ISAAC_AUDIO)
     APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_AUDIO=1)
 endif()
 
+# The game's own controller path (libstem XInput) over a synthetic XInput
+# module; the SDL backend supplies the pad snapshot.
+option(ISAAC_XINPUT "Synthetic XInput gamepad" ON)
+if(ISAAC_XINPUT)
+  if(NOT ISAAC_SDL)
+    message(FATAL_ERROR "ISAAC_XINPUT needs ISAAC_SDL (kage_sdl_backend.c)")
+  endif()
+  list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/host_vita_xinput.c")
+  set_property(SOURCE
+    "${ISAAC_RUNTIME}/host_vita_first_fault.c"
+    "${ISAAC_RUNTIME}/host_vita_import_id.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_XINPUT=1)
+endif()
+
 add_executable(isaac-linux64
   ${ISAAC_HOST_SOURCES}
   ${ISAAC_RUNTIME_SOURCES}

@@ -452,9 +452,16 @@ static void vita_startup_CreateDirectoryA(CPU *__restrict c)
             c, path, native_path, sizeof native_path))
         return;
     if (mkdir(native_path, 0777) == 0) {
+#if defined(__SWITCH__)
+        isaac_vita_log("CreateDirectoryA ok: %s", native_path);
+#endif
         c->eax = 1U;
     } else {
         int native_error = errno;
+#if defined(__SWITCH__)
+        isaac_vita_log("CreateDirectoryA errno=%d: %s", native_error,
+                       native_path);
+#endif
         if (native_error == EEXIST) {
             vita_startup_set_last_error(c,
                 ISAAC_VITA_STARTUP_ERROR_ALREADY_EXISTS);

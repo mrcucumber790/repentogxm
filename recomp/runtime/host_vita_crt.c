@@ -3777,6 +3777,14 @@ static void vita_crt_fopen(CPU *__restrict c)
         return;
     }
 #if defined(__SWITCH__)
+    {
+        size_t length = strlen(native_path);
+        if (length >= 7U && !strcmp(native_path + length - 7U, "log.txt"))
+            isaac_vita_log("log.txt fopen(%s, %s): %s", native_path, mode,
+                           stream ? "ok" : strerror(errno));
+    }
+#endif
+#if defined(__SWITCH__)
     /* The game never flushes log.txt and a Switch app is usually closed from
      * HOME, which drops stdio buffers: keep the log line buffered. */
     if (stream) {

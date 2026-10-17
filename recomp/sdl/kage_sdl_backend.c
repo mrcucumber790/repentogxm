@@ -6,6 +6,8 @@
  * keeps its own render-target and present logic (manual_kage.c); this file
  * only replaces what GLFW/WGL did on Windows. */
 #include "kage_pc_backend.h"
+#include "kage_vita_input.h"
+#include "kage_vita_input_test_ctrl.h" /* SCE_CTRL_* bits */
 
 #include <SDL.h>
 
@@ -122,20 +124,39 @@ static int glfw_key_from_scancode(SDL_Scancode code)
  * (WASD), face buttons shoot (arrows), RB item (Space), LB bomb (E), RT card
  * (Q), LT drop (Left Ctrl), Back map (Tab), Start pause (Esc), right-stick
  * click confirm (Enter). */
+/* Gamepad for the game's own controller path: host_vita_xinput.c presents a
+ * synthetic XInput module and builds XINPUT_STATE from this snapshot (Vita
+ * button bits, sticks 0..255 with 128 neutral and Y growing downward).  The
+ * buttons are positional, as on an Xbox pad: bottom face button is XInput A
+ * (confirm, shoot down), right is B (back, shoot right), left is X, top is Y.
+ * Shoulders: L bomb (LB), R pill/card (RB), ZL/LT active item, ZR/RT drop,
+ * -/Back map, +/Start pause.  Once the game owns the pad, the keyboard
+ * translation below is off so no button fires twice. */
+static int s_xinput_active;
+static uint32_t s_pad_packet;
+static kage_vita_gamepad_snapshot s_pad_last;
+
+void kage_vita_input_set_xinput_active(int active)
+{
+    s_xinput_active = active ? 1 : 0;
+}
+
+static uint8_t kage_sdl_axis_byte(int value, int invert)
+{
+    int v = invert ? -value : value;
+
+    v = (v + 32768) >> 8;
+    return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+}
+
 #if defined(__SWITCH__)
-/* Switch: read the controller through libnx so buttons are positional and
- * independent of SDL's label mapping.  Left stick/d-pad move (WASD), right
- * stick shoots (arrows), A confirms (Enter), B goes back (Esc), R item
- * (Space), L or X bomb (E), ZR or Y card (Q), ZL drop (Left Ctrl), - map
- * (Tab), + pause (Esc). */
 static PadState s_switch_pad;
 static int s_switch_pad_ready;
 
-static void kage_sdl_pad_keys(uint8_t keys[KAGE_PC_KEY_COUNT])
+static int kage_sdl_pad_read(kage_vita_gamepad_snapshot *out)
 {
     u64 held;
     HidAnalogStickState ls, rs;
-    const int dz = 12000;
 
     if (!s_switch_pad_ready) {
         padConfigureInput(1, HidNpadStyleSet_NpadStandard);
@@ -143,48 +164,95 @@ static void kage_sdl_pad_keys(uint8_t keys[KAGE_PC_KEY_COUNT])
         s_switch_pad_ready = 1;
     }
     padUpdate(&s_switch_pad);
+    if (!padIsConnected(&s_switch_pad))
+        return 0;
     held = padGetButtons(&s_switch_pad);
     ls = padGetStickPos(&s_switch_pad, 0);
     rs = padGetStickPos(&s_switch_pad, 1);
-    /* libnx sticks: +y is up. */
-    if ((held & HidNpadButton_Up) || ls.y > dz)
-        keys['W'] = 1;
-    if ((held & HidNpadButton_Down) || ls.y < -dz)
-        keys['S'] = 1;
-    if ((held & HidNpadButton_Left) || ls.x < -dz)
-        keys['A'] = 1;
-    if ((held & HidNpadButton_Right) || ls.x > dz)
-        keys['D'] = 1;
-    if (rs.y > dz)
-        keys[GLFW_KEY_UP] = 1;
-    if (rs.y < -dz)
-        keys[GLFW_KEY_DOWN] = 1;
-    if (rs.x < -dz)
-        keys[GLFW_KEY_LEFT] = 1;
-    if (rs.x > dz)
-        keys[GLFW_KEY_RIGHT] = 1;
-    if (held & HidNpadButton_A)
-        keys[GLFW_KEY_ENTER] = 1;
-    if (held & (HidNpadButton_B | HidNpadButton_Plus))
-        keys[GLFW_KEY_ESCAPE] = 1;
+    if (held & HidNpadButton_Up) out->buttons |= SCE_CTRL_UP;
+    if (held & HidNpadButton_Down) out->buttons |= SCE_CTRL_DOWN;
+    if (held & HidNpadButton_Left) out->buttons |= SCE_CTRL_LEFT;
+    if (held & HidNpadButton_Right) out->buttons |= SCE_CTRL_RIGHT;
+    if (held & HidNpadButton_B) out->buttons |= SCE_CTRL_CROSS;
+    if (held & HidNpadButton_A) out->buttons |= SCE_CTRL_CIRCLE;
+    if (held & HidNpadButton_Y) out->buttons |= SCE_CTRL_SQUARE;
+    if (held & HidNpadButton_X) out->buttons |= SCE_CTRL_TRIANGLE;
+    if (held & HidNpadButton_L) out->buttons |= SCE_CTRL_LTRIGGER;
+    if (held & HidNpadButton_ZR) out->buttons |= SCE_CTRL_SELECT;
+    if (held & HidNpadButton_Plus) out->buttons |= SCE_CTRL_START;
     if (held & HidNpadButton_R)
-        keys[GLFW_KEY_SPACE] = 1;
-    if (held & (HidNpadButton_L | HidNpadButton_X))
-        keys['E'] = 1;
-    if (held & (HidNpadButton_ZR | HidNpadButton_Y))
-        keys['Q'] = 1;
-    if (held & HidNpadButton_ZL)
-        keys[GLFW_KEY_LEFT_CONTROL] = 1;
+        out->xinput_buttons |= KAGE_VITA_INPUT_XINPUT_RIGHT_SHOULDER;
     if (held & HidNpadButton_Minus)
-        keys[GLFW_KEY_TAB] = 1;
+        out->xinput_buttons |= KAGE_VITA_INPUT_XINPUT_BACK;
+    if (held & HidNpadButton_ZL)
+        out->xinput_left_trigger = KAGE_VITA_INPUT_XINPUT_TRIGGER_FULL;
+    /* libnx sticks: +y is up. */
+    out->lx = kage_sdl_axis_byte(ls.x, 0);
+    out->ly = kage_sdl_axis_byte(ls.y, 1);
+    out->rx = kage_sdl_axis_byte(rs.x, 0);
+    out->ry = kage_sdl_axis_byte(rs.y, 1);
+    return 1;
 }
 #else
+static int kage_sdl_pad_read(kage_vita_gamepad_snapshot *out)
+{
+    SDL_GameController *pad = s_kage.pad;
+
+    if (!pad)
+        return 0;
+#define PAD(b) SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_##b)
+#define AXIS(a) SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_##a)
+    if (PAD(DPAD_UP)) out->buttons |= SCE_CTRL_UP;
+    if (PAD(DPAD_DOWN)) out->buttons |= SCE_CTRL_DOWN;
+    if (PAD(DPAD_LEFT)) out->buttons |= SCE_CTRL_LEFT;
+    if (PAD(DPAD_RIGHT)) out->buttons |= SCE_CTRL_RIGHT;
+    if (PAD(A)) out->buttons |= SCE_CTRL_CROSS;
+    if (PAD(B)) out->buttons |= SCE_CTRL_CIRCLE;
+    if (PAD(X)) out->buttons |= SCE_CTRL_SQUARE;
+    if (PAD(Y)) out->buttons |= SCE_CTRL_TRIANGLE;
+    if (PAD(LEFTSHOULDER)) out->buttons |= SCE_CTRL_LTRIGGER;
+    if (AXIS(TRIGGERRIGHT) > 16000) out->buttons |= SCE_CTRL_SELECT;
+    if (PAD(START)) out->buttons |= SCE_CTRL_START;
+    if (PAD(RIGHTSHOULDER))
+        out->xinput_buttons |= KAGE_VITA_INPUT_XINPUT_RIGHT_SHOULDER;
+    if (PAD(BACK))
+        out->xinput_buttons |= KAGE_VITA_INPUT_XINPUT_BACK;
+    if (AXIS(TRIGGERLEFT) > 16000)
+        out->xinput_left_trigger = KAGE_VITA_INPUT_XINPUT_TRIGGER_FULL;
+    /* SDL sticks: +y is down, as on the Vita. */
+    out->lx = kage_sdl_axis_byte(AXIS(LEFTX), 0);
+    out->ly = kage_sdl_axis_byte(AXIS(LEFTY), 0);
+    out->rx = kage_sdl_axis_byte(AXIS(RIGHTX), 0);
+    out->ry = kage_sdl_axis_byte(AXIS(RIGHTY), 0);
+#undef PAD
+#undef AXIS
+    return 1;
+}
+#endif
+
+int kage_vita_input_gamepad_snapshot(kage_vita_gamepad_snapshot *snapshot)
+{
+    kage_vita_gamepad_snapshot now;
+
+    if (!snapshot || !s_kage.ready)
+        return 0;
+    memset(&now, 0, sizeof now);
+    if (!kage_sdl_pad_read(&now))
+        return 0;
+    now.packet_number = s_pad_last.packet_number;
+    if (memcmp(&now, &s_pad_last, sizeof now) != 0)
+        now.packet_number = ++s_pad_packet;
+    s_pad_last = now;
+    *snapshot = now;
+    return 1;
+}
+
 static void kage_sdl_pad_keys(uint8_t keys[KAGE_PC_KEY_COUNT])
 {
     SDL_GameController *pad = s_kage.pad;
     int lx, ly;
 
-    if (!pad)
+    if (!pad || s_xinput_active)
         return;
 #define PAD(b) SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_##b)
 #define AXIS(a) SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_##a)
@@ -223,7 +291,6 @@ static void kage_sdl_pad_keys(uint8_t keys[KAGE_PC_KEY_COUNT])
 #undef PAD
 #undef AXIS
 }
-#endif
 
 static void kage_sdl_pump(void)
 {
