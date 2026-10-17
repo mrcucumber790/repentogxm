@@ -454,16 +454,25 @@ static unsigned s_spikes;
 
 void isaac_vita_crt_flush_game_log(void);
 
-/* Called at the end of each main loop iteration (limiter exit): log frames
- * over 25 ms with where the time went (update = game logic, render = drawing
- * including the buffer swap). */
+void switch_sampler_frame(uint64_t begin, uint64_t end, int slow);
+void switch_sampler_flush(void);
+
+/* Called once per main loop iteration (at the game update): log frames over
+ * 25 ms with where the time went (update = game logic, render = drawing
+ * including the buffer swap, limiter = the frame cap's wait). */
 static void kage_sdl_switch_spike_note(void)
 {
     static Uint64 last;
+    static uint64_t last_tick;
     Uint64 now = SDL_GetPerformanceCounter();
     Uint64 freq = SDL_GetPerformanceFrequency();
+    uint64_t tick = armGetSystemTick();
+    int slow = last && now - last > freq / 40u;
 
-    if (!s_boosted && last && now - last > freq / 40u && s_spikes < 64u) {
+    if (last_tick && !s_boosted)
+        switch_sampler_frame(last_tick, tick, slow);
+    last_tick = tick;
+    if (!s_boosted && slow && s_spikes < 64u) {
         double ms = 1000.0 / (double)freq;
         ++s_spikes;
         isaac_vita_log("isaac-switch: spike %.1f ms: update %.1f, render "
@@ -517,6 +526,7 @@ static void kage_sdl_switch_frame_note(void)
         s_spikes = 0u;
         isaac_vita_log_flush();
         isaac_vita_crt_flush_game_log();
+        switch_sampler_flush();
     }
 }
 #endif
@@ -562,6 +572,7 @@ void kage_pc_backend_note_service_entry(void) {}
 void kage_pc_backend_note_update_entry(void)
 {
 #if defined(__SWITCH__)
+    kage_sdl_switch_spike_note();
     s_mark_update = SDL_GetPerformanceCounter();
 #endif
 }
@@ -600,7 +611,6 @@ void kage_pc_backend_note_limiter_exit(void)
         s_t_limiter += d;
         s_f_limiter += d;
     }
-    kage_sdl_switch_spike_note();
     s_mark_limiter = 0u;
 #endif
 }

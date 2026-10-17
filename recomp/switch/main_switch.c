@@ -39,9 +39,13 @@ extern char *fake_heap_end;
 static const char *s_pe;
 static int s_result;
 
+void switch_sampler_start(void);
+
 static void *game_thread(void *arg)
 {
     (void)arg;
+    /* Diagnostic: sample this thread's PC into samples.bin. */
+    switch_sampler_start();
     s_result = isaac_vita_run_first_fault(s_pe);
     return NULL;
 }

@@ -103,6 +103,7 @@ if(NINTENDO_SWITCH)
     ../switch/main_switch.c
     ../switch/switch_paths.c
     ../switch/switch_malloc.c
+    ../switch/switch_sampler.c
     platform_linux.c
     psp2_posix.c
     guest_window.c)
