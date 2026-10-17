@@ -79,6 +79,10 @@ int main(int argc, char **argv)
     }
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/isaac", 0777);
+    /* The game and the SDL backend report on stderr (libepoxy, GL setup);
+     * on hardware nothing reads it, so keep it in a file next to the log. */
+    if (freopen("sdmc:/switch/isaac/stderr.txt", "w", stderr))
+        setvbuf(stderr, NULL, _IONBF, 0);
     if (stat(pe, &st) != 0) {
         show_error("Missing sdmc:/switch/isaac/isaac-ng.exe.unpacked.exe");
         return 1;

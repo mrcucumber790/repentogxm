@@ -261,6 +261,11 @@ int kage_pc_backend_initialize(uint32_t width, uint32_t height)
     version = get_string ? (const unsigned char *)get_string(0x1f02u) : NULL;
     snprintf(s_kage.gl_version, sizeof s_kage.gl_version, "%s",
              version ? (const char *)version : "unknown");
+    if (get_string && get_string(0x1f01u)) {
+        size_t used = strlen(s_kage.gl_version);
+        snprintf(s_kage.gl_version + used, sizeof s_kage.gl_version - used,
+                 " / %s", (const char *)get_string(0x1f01u));
+    }
 
     if (SDL_NumJoysticks() > 0) {
         int i;
