@@ -429,6 +429,33 @@ if(ISAAC_IMAGE_RETAIN)
   list(APPEND ISAAC_WRAP_SYMBOLS sub_0056d8c0)
 endif()
 
+# Native stb_vorbis (host_native_vorbis64.c): the game's OGG decoder
+# (stb_vorbis v1.04, ~10-20x slower translated) runs natively for whole-sample
+# SFX loads and music streams.  Unlike the Vita module it never clones the
+# guest decoder state: each translated open is mirrored by a native open over
+# the same bytes (guest memory, or the KAGE stream through guest_call), and
+# the wrapped get_samples / seek_start / deinit serve the mirror.
+option(ISAAC_NATIVE_VORBIS "Native stb_vorbis mirrors for OGG decoding" ON)
+if(ISAAC_NATIVE_VORBIS)
+  if(NOT ISAAC_AUDIO)
+    message(FATAL_ERROR "ISAAC_NATIVE_VORBIS needs ISAAC_AUDIO")
+  endif()
+  list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/host_native_vorbis64.c")
+  # IEEE single-precision steps as the PE's SSE code does them (no FMA
+  # contraction on AArch64), so Linux and Switch decode the same PCM.
+  set_property(SOURCE "${ISAAC_RUNTIME}/host_native_vorbis64.c"
+    APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+  set_property(SOURCE "${ISAAC_RUNTIME}/entry_vita.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_NATIVE_VORBIS64=1)
+  list(APPEND ISAAC_WRAP_SYMBOLS
+    sub_005bdf80   # stb_vorbis_get_samples_short_interleaved
+    sub_005b7740   # set_file_offset (Decode's inlined seek_start)
+    sub_005bb260   # vorbis_pump_first_frame
+    sub_005bd310   # vorbis_deinit
+    sub_005bd740   # stb_vorbis_open_file (KAGE stream edit)
+    sub_005bd8b0)  # stb_vorbis_open_memory
+endif()
+
 if(ISAAC_ARCHIVE_MINIZ_FASTPATH OR ISAAC_NATIVE_PNG)
   # tinfl core shared by the archive seam and the native PNG decoder.
   list(APPEND ISAAC_RUNTIME_SOURCES

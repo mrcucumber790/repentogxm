@@ -57,6 +57,9 @@
 #if defined(ISAAC_VITA_NATIVE_PNG)
 #include "host_vita_native_png.h"
 #endif
+#if defined(ISAAC_NATIVE_VORBIS64)
+#include "host_native_vorbis64.h"
+#endif
 
 #if ISAAC_VITA_KAGE
 #include <psp2/kernel/processmgr.h>
@@ -537,6 +540,10 @@ done:
         }
         isaac_vita_audio_log_final();
     }
+#endif
+#if defined(ISAAC_NATIVE_VORBIS64)
+    /* 64-bit hosts: one summary line for the native stb_vorbis mirrors. */
+    isaac_native_vorbis_report("shutdown");
 #endif
 #if defined(ISAAC_VITA_IMAGE_RETAIN)
     /* Final receipt, then stop the release observer from retaining while the
