@@ -73,6 +73,22 @@ else()
     "${ISAAC_RUNTIME}/manual_kage_disabled.c")
 endif()
 
+# MSVC x86 C++ exceptions (runtime/guest_cxx_eh.c): throw, catch, unwind
+# funclets and catch continuations.  Needs a corpus generated with
+# GUEST_CXX_EH=1 (recomp/cxx_eh.py); the Vita target keeps it off.
+option(ISAAC_CXX_EH "MSVC C++ exception handling (GUEST_CXX_EH)" ON)
+file(STRINGS "${ISAAC_GENERATED_DIR}/guest_funcs.h" ISAAC_CXX_EH_CORPUS
+  REGEX "^#define GUEST_CXX_EH_CORPUS 1$" LIMIT_COUNT 1)
+if(ISAAC_CXX_EH)
+  if(NOT ISAAC_CXX_EH_CORPUS)
+    message(FATAL_ERROR
+      "ISAAC_CXX_EH needs a corpus generated with GUEST_CXX_EH=1 "
+      "(GUEST_CXX_EH=1 python3 recomp/gen_all.py ...); "
+      "or configure with -DISAAC_CXX_EH=OFF")
+  endif()
+  list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/guest_cxx_eh.c")
+endif()
+
 set(ISAAC_HOST_SOURCES
   main_linux.c
   platform_linux.c
@@ -133,6 +149,7 @@ target_compile_definitions(isaac-linux64 PRIVATE
   GUEST_MEM_WINDOW=1
   GUEST_IMAGE_BASE=${ISAAC_GUEST_BASE}u
   GUEST_STACK_REQUIRED=1
+  $<$<BOOL:${ISAAC_CXX_EH}>:GUEST_CXX_EH=1>
   ISAAC_VITA_HAS_RUNTIME=1
   $<IF:$<BOOL:${ISAAC_LUA}>,ISAAC_VITA_LUA=1,ISAAC_VITA_LUA_OFF_CLOSE_NOOP=1>
   _GNU_SOURCE=1)
