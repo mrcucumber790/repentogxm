@@ -499,6 +499,15 @@ endif()
 set_property(SOURCE "${ISAAC_RUNTIME}/guest.c" APPEND PROPERTY
   COMPILE_DEFINITIONS GUEST_GENERATION_SYMBOL=${ISAAC_GENERATION_SYMBOL}
     ISAAC_VITA_IMPORT_ID_DISPATCH=1)
+# Indirect calls and import slots resolve by binary search per call
+# (guest_lookup + guest_import_lookup were ~10% of slow frames on the
+# Switch); memoize them (ISAAC_VITA_GUEST_LOOKUP_CACHE, owner: guest.c).
+option(ISAAC_GUEST_LOOKUP_CACHE
+  "Cache guest_lookup / import slot lookups (ISAAC_VITA_GUEST_LOOKUP_CACHE)" ON)
+if(ISAAC_GUEST_LOOKUP_CACHE)
+  set_property(SOURCE "${ISAAC_RUNTIME}/guest.c" APPEND PROPERTY
+    COMPILE_DEFINITIONS ISAAC_VITA_GUEST_LOOKUP_CACHE=1)
+endif()
 
 if(ISAAC_FRAME_SPIKE_LOG)
   target_link_options(isaac-linux64 PRIVATE -Wl,--wrap=SDL_GL_SwapWindow)

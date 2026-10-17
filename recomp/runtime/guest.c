@@ -1317,7 +1317,8 @@ static const guest_fn *g_fns;
 static uint32_t        g_count;
 
 #if defined(ISAAC_VITA_GUEST_LOOKUP_CACHE)
-#define GUEST_LOOKUP_CACHE_COUNT 256U
+#define GUEST_LOOKUP_CACHE_BITS 12U
+#define GUEST_LOOKUP_CACHE_COUNT (1U << GUEST_LOOKUP_CACHE_BITS)
 #define GUEST_IMPORT_DENSE_SLOT_COUNT 438U
 
 typedef struct guest_lookup_cache_entry {
@@ -1337,9 +1338,9 @@ static uint32_t g_guest_import_dense_span;
 
 static uint32_t guest_lookup_cache_index(uint32_t key)
 {
-    /* Multiplicative hashing uses the high byte so the low alignment bits of
-     * x86 function RVAs cannot collapse the 256 direct-mapped entries. */
-    return (key * UINT32_C(2654435761)) >> 24;
+    /* Multiplicative hashing uses the high bits so the low alignment bits of
+     * x86 function RVAs cannot collapse the direct-mapped entries. */
+    return (key * UINT32_C(2654435761)) >> (32U - GUEST_LOOKUP_CACHE_BITS);
 }
 
 static void guest_dispatch_cache_invalidate(void)
