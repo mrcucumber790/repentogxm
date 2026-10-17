@@ -372,6 +372,10 @@ void kage_pc_backend_shutdown(void)
 }
 
 #if defined(__SWITCH__)
+/* Per-window time split (performance counter ticks): render, frame limiter
+ * (idle wait), buffer swap.  The rest of the frame is game update. */
+static Uint64 s_t_render, s_t_limiter, s_t_swap, s_mark_render, s_mark_limiter;
+
 /* main_switch.c raises the CPU clock for the initial load; drop it once the
  * game renders steadily (boost mode lowers the GPU clock).  Also log the
  * frame rate now and then. */
@@ -399,9 +403,15 @@ static void kage_sdl_switch_frame_note(void)
         window_start = now;
     if (++window_frames == 600u) {
         double seconds = (double)(now - window_start) / (double)freq;
-        isaac_vita_log("isaac-switch: %.1f fps over %u frames",
+        double ms = 1000.0 / (double)freq / (double)window_frames;
+        isaac_vita_log("isaac-switch: %.1f fps over %u frames; per frame "
+                       "render %.2f ms, limiter %.2f ms, swap %.2f ms, "
+                       "total %.2f ms",
                        seconds > 0.0 ? window_frames / seconds : 0.0,
-                       window_frames);
+                       window_frames, (double)s_t_render * ms,
+                       (double)s_t_limiter * ms, (double)s_t_swap * ms,
+                       (double)(now - window_start) * ms);
+        s_t_render = s_t_limiter = s_t_swap = 0u;
         window_start = now;
         window_frames = 0u;
     }
@@ -417,7 +427,15 @@ int kage_pc_backend_present(void)
                  "KAGE SDL backend: present without a context");
         return 0;
     }
+#if defined(__SWITCH__)
+    {
+        Uint64 t0 = SDL_GetPerformanceCounter();
+        SDL_GL_SwapWindow(s_kage.window);
+        s_t_swap += SDL_GetPerformanceCounter() - t0;
+    }
+#else
     SDL_GL_SwapWindow(s_kage.window);
+#endif
     kage_sdl_pump();
     SDL_GL_GetDrawableSize(s_kage.window, &w, &h);
     s_kage.width = (uint32_t)w;
@@ -438,10 +456,34 @@ void kage_pc_backend_note_loop_head(void) {}
 void kage_pc_backend_note_service_entry(void) {}
 void kage_pc_backend_note_update_entry(void) {}
 void kage_pc_backend_audio_cooperative_poll(struct CPU *cpu) { (void)cpu; }
-void kage_pc_backend_note_render_entry(void) {}
-void kage_pc_backend_note_render_return(void) {}
-void kage_pc_backend_note_limiter_entry(void) {}
-void kage_pc_backend_note_limiter_exit(void) {}
+void kage_pc_backend_note_render_entry(void)
+{
+#if defined(__SWITCH__)
+    s_mark_render = SDL_GetPerformanceCounter();
+#endif
+}
+void kage_pc_backend_note_render_return(void)
+{
+#if defined(__SWITCH__)
+    if (s_mark_render)
+        s_t_render += SDL_GetPerformanceCounter() - s_mark_render;
+    s_mark_render = 0u;
+#endif
+}
+void kage_pc_backend_note_limiter_entry(void)
+{
+#if defined(__SWITCH__)
+    s_mark_limiter = SDL_GetPerformanceCounter();
+#endif
+}
+void kage_pc_backend_note_limiter_exit(void)
+{
+#if defined(__SWITCH__)
+    if (s_mark_limiter)
+        s_t_limiter += SDL_GetPerformanceCounter() - s_mark_limiter;
+    s_mark_limiter = 0u;
+#endif
+}
 void kage_pc_backend_note_menu_init(uint32_t site) { (void)site; }
 void kage_pc_backend_note_menu_render(uint32_t site) { (void)site; }
 void kage_pc_backend_note_menu_character(uint32_t site) { (void)site; }
