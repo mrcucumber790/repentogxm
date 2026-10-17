@@ -102,25 +102,37 @@ int isaac_vita_archive_miniz_guest_try(CPU *__restrict c)
 
     object = c->edi;
     tokens[0] = isaac_vita_guest_heap_lease_exact_range(
-        (const void *)(uintptr_t)state,
-        (const void *)(uintptr_t)state,
+        guest_ptr(state),
+        guest_ptr(state),
         ISAAC_VITA_ARCHIVE_MINIZ_STATE_BYTES);
     if (tokens[0] == 0U)
         return 0;
-    tokens[1] = isaac_vita_guest_heap_lease_exact_range(
-        (const void *)(uintptr_t)object,
-        (const void *)(uintptr_t)input,
-        ARCHIVED_FILE_NATIVE_RANGE);
-    if (tokens[1] == 0U)
-        return release_for_fallback(c, tokens, object);
+#if defined(ISAAC_VITA_ARCHIVE_STACK_OBJECTS)
+    /* An ArchivedFile constructed in a caller's frame (the common case on
+     * the 64-bit hosts) cannot be freed under us: accept its range when it
+     * lies wholly inside the live guest stack above our five arguments. */
+    if (object >= c->esp + 24U && object < c->stack_ceiling &&
+            input < c->stack_ceiling &&
+            ARCHIVED_FILE_NATIVE_RANGE <= c->stack_ceiling - input) {
+        tokens[1] = 0U;
+    } else
+#endif
+    {
+        tokens[1] = isaac_vita_guest_heap_lease_exact_range(
+            guest_ptr(object),
+            guest_ptr(input),
+            ARCHIVED_FILE_NATIVE_RANGE);
+        if (tokens[1] == 0U)
+            return release_for_fallback(c, tokens, object);
+    }
 
     status = isaac_vita_archive_miniz_native(
-        (void *)(uintptr_t)state,
-        (const uint8_t *)(uintptr_t)input,
-        (uint32_t *)(uintptr_t)input_size_address,
-        (uint8_t *)(uintptr_t)output_start,
-        (uint8_t *)(uintptr_t)output_next,
-        (uint32_t *)(uintptr_t)output_size_address,
+        guest_ptr(state),
+        (const uint8_t *)guest_ptr(input),
+        (uint32_t *)guest_ptr(input_size_address),
+        (uint8_t *)guest_ptr(output_start),
+        (uint8_t *)guest_ptr(output_next),
+        (uint32_t *)guest_ptr(output_size_address),
         flags);
     c->eax = (uint32_t)status;
 

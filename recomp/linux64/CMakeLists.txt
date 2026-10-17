@@ -27,6 +27,7 @@ endif()
 
 set(ISAAC_RUNTIME "${CMAKE_CURRENT_SOURCE_DIR}/../runtime")
 set(ISAAC_VITA "${CMAKE_CURRENT_SOURCE_DIR}/../vita")
+set(ISAAC_WRAP_SYMBOLS)
 
 file(GLOB ISAAC_GENERATED_C "${ISAAC_GENERATED_DIR}/guest_*.c")
 
@@ -169,6 +170,148 @@ if(ISAAC_XINPUT)
     APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_XINPUT=1)
 endif()
 
+# ---------------------------------------------------------------------------
+# Native fast paths ported from the Vita target (recomp/vita/CMakeLists.txt,
+# where each option is documented).  They replace hot translated library code
+# (libpng, zlib, stb_vorbis, ...) with native code at link-time --wrap seams
+# or generator-emitted entry seams; every seam keeps the translated body as
+# its fallback.  The NEON variants are selected only on AArch64 (Switch); the
+# scalar code paths are used elsewhere.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" OR NINTENDO_SWITCH)
+  set(ISAAC_HOST_NEON ON)
+else()
+  set(ISAAC_HOST_NEON OFF)
+endif()
+
+include("${ISAAC_VITA}/generated_definitions.cmake")
+# The generated source that defines `symbol` (exactly one), for seams that
+# need a compile definition on their generated owner.
+function(isaac_generated_owner symbol output)
+  set(owners)
+  foreach(source IN LISTS ISAAC_GENERATED_C)
+    isaac_generated_definition_lines("${source}" match LIMIT_COUNT 2
+      REGEX "^void ${symbol}\\(CPU \\*__restrict c\\)$")
+    if(match)
+      list(APPEND owners "${source}")
+    endif()
+  endforeach()
+  list(LENGTH owners count)
+  if(NOT count EQUAL 1)
+    message(FATAL_ERROR "${symbol} must have one generated owner; found ${count}")
+  endif()
+  set(${output} "${owners}" PARENT_SCOPE)
+endfunction()
+
+# Exact-range heap leases (host_vita_heap.c) for the seams that run native
+# code on guest heap objects.
+set(ISAAC_HEAP_LEASE_FEATURES)
+
+# Packed archives (.a): the miniz v1.15 inflate coroutine (0x5aeb00) behind
+# its generated entry seam, and the per-block word XOR (0x5b06f0, wrapped)
+# with its ISAAC PRNG refresh.  Every resource read during loads and room
+# transitions goes through both.
+option(ISAAC_ARCHIVE_MINIZ_FASTPATH
+  "Native archive inflate (ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH)" ON)
+option(ISAAC_ARCHIVE_XOR_FASTPATH
+  "Native archive XOR + PRNG refresh (ISAAC_VITA_ARCHIVE_XOR_FASTPATH)" ON)
+if(ISAAC_ARCHIVE_MINIZ_FASTPATH)
+  isaac_generated_owner(sub_005aeb00 ISAAC_ARCHIVE_MINIZ_OWNER)
+  list(APPEND ISAAC_RUNTIME_SOURCES
+    "${ISAAC_RUNTIME}/host_vita_archive_miniz_guest.c")
+  set_property(SOURCE ${ISAAC_ARCHIVE_MINIZ_OWNER}
+    "${ISAAC_RUNTIME}/host_vita_archive_miniz_guest.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH=1)
+  list(APPEND ISAAC_HEAP_LEASE_FEATURES ISAAC_VITA_ARCHIVE_MINIZ_FASTPATH=1)
+  set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_archive_miniz_guest.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS ISAAC_VITA_HEAP_RANGE_LEASE=1
+      ISAAC_VITA_ARCHIVE_STACK_OBJECTS=1)
+endif()
+if(ISAAC_ARCHIVE_XOR_FASTPATH)
+  list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/host_vita_archive_xor.c")
+  set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_archive_xor.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS
+      ISAAC_VITA_ARCHIVE_XOR_FASTPATH=1
+      ISAAC_VITA_ARCHIVE_XOR_NATIVE_REFRESH=1
+      ISAAC_VITA_ARCHIVE_STACK_OBJECTS=1
+      ISAAC_VITA_HEAP_RANGE_LEASE=1)
+  list(APPEND ISAAC_HEAP_LEASE_FEATURES ISAAC_VITA_ARCHIVE_XOR_FASTPATH=1)
+  list(APPEND ISAAC_WRAP_SYMBOLS sub_005b06f0)
+endif()
+# Native PNG: png_read_row (0x5b1500) is wrapped; whole-image inflate and
+# unfilter natively into a reserved scratch.
+option(ISAAC_NATIVE_PNG "Native PNG row decode (ISAAC_VITA_NATIVE_PNG)" ON)
+set(ISAAC_NATIVE_PNG_RESERVE_MB 16 CACHE STRING
+  "MiB of PNG scratch reserved at start (whole-image staging)")
+option(ISAAC_NATIVE_PNG_REUSE
+  "Reuse decoded rows of identical PNGs (ISAAC_VITA_NATIVE_PNG_REUSE)" ON)
+set(ISAAC_NATIVE_PNG_REUSE_MB 4 CACHE STRING "MiB for decoded PNG reuse (1..8)")
+if(ISAAC_NATIVE_PNG)
+  list(APPEND ISAAC_RUNTIME_SOURCES
+    "${ISAAC_RUNTIME}/host_vita_native_png.c"
+    "${ISAAC_RUNTIME}/host_vita_native_png_adler.c"
+    "${ISAAC_RUNTIME}/host_vita_native_png_miniz.c"
+    "${ISAAC_RUNTIME}/host_vita_native_png_libdeflate.c")
+  set(ISAAC_NP_DEFS
+    ISAAC_VITA_NATIVE_PNG=1
+    ISAAC_VITA_NATIVE_PNG_RESERVE_MB=${ISAAC_NATIVE_PNG_RESERVE_MB}
+    ISAAC_VITA_NATIVE_PNG_BUILD_ID=\"linux64\"
+    ISAAC_VITA_NATIVE_PNG_ADLER_NEON=1
+    ISAAC_VITA_NATIVE_PNG_LIBDEFLATE_STRICT=1
+    ISAAC_VITA_NATIVE_PNG_FIXED_TABLES=1
+    ISAAC_VITA_NATIVE_PNG_TINFL_HEADER_RESET=1
+    ISAAC_VITA_NATIVE_PNG_CLOCK_ELISION=1)
+  if(ISAAC_HOST_NEON)
+    list(APPEND ISAAC_NP_DEFS
+      ISAAC_VITA_NATIVE_PNG_RGBA_NEON=1
+      ISAAC_VITA_NATIVE_PNG_LZ_NEON=1
+      ISAAC_VITA_NATIVE_PNG_LZ_D4_NEON=1)
+  endif()
+  if(ISAAC_NATIVE_PNG_REUSE)
+    list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/host_vita_png_reuse.c")
+    list(APPEND ISAAC_NP_DEFS
+      ISAAC_VITA_NATIVE_PNG_REUSE=1
+      ISAAC_VITA_NATIVE_PNG_REUSE_TINFL=1
+      ISAAC_VITA_NATIVE_PNG_REUSE_MB=${ISAAC_NATIVE_PNG_REUSE_MB})
+  endif()
+  set_property(SOURCE
+    "${ISAAC_RUNTIME}/host_vita_native_png.c"
+    "${ISAAC_RUNTIME}/host_vita_native_png_adler.c"
+    "${ISAAC_RUNTIME}/host_vita_native_png_miniz.c"
+    "${ISAAC_RUNTIME}/host_vita_native_png_libdeflate.c"
+    "${ISAAC_RUNTIME}/host_vita_png_reuse.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS ${ISAAC_NP_DEFS})
+  set_property(SOURCE "${ISAAC_RUNTIME}/entry_vita.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS
+      ISAAC_VITA_NATIVE_PNG=1
+      ISAAC_VITA_NATIVE_PNG_RESERVE_MB=${ISAAC_NATIVE_PNG_RESERVE_MB})
+  list(APPEND ISAAC_WRAP_SYMBOLS sub_005b1500)
+endif()
+
+if(ISAAC_ARCHIVE_MINIZ_FASTPATH OR ISAAC_NATIVE_PNG)
+  # tinfl core shared by the archive seam and the native PNG decoder.
+  list(APPEND ISAAC_RUNTIME_SOURCES
+    "${ISAAC_RUNTIME}/host_vita_archive_miniz_native.c")
+endif()
+
+if(ISAAC_HEAP_LEASE_FEATURES)
+  set_property(SOURCE "${ISAAC_RUNTIME}/host_vita_heap.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS
+      ISAAC_VITA_HEAP_RANGE_LEASE=1 ${ISAAC_HEAP_LEASE_FEATURES})
+endif()
+
+# Frame-time spike log: times present-to-present through a link-time wrap
+# of SDL_GL_SwapWindow and logs every frame above ISAAC_FRAME_SPIKE_MS.
+option(ISAAC_FRAME_SPIKE_LOG "Log frame-time spikes (diagnostic)" OFF)
+set(ISAAC_FRAME_SPIKE_MS 25 CACHE STRING "frame length logged as a spike, ms")
+if(ISAAC_FRAME_SPIKE_LOG)
+  if(NOT ISAAC_SDL)
+    message(FATAL_ERROR "ISAAC_FRAME_SPIKE_LOG needs ISAAC_SDL")
+  endif()
+  list(APPEND ISAAC_HOST_SOURCES frame_spike_log.c)
+  set_property(SOURCE frame_spike_log.c APPEND PROPERTY COMPILE_DEFINITIONS
+    ISAAC_FRAME_SPIKE_MS=${ISAAC_FRAME_SPIKE_MS})
+endif()
+
 add_executable(isaac-linux64
   ${ISAAC_HOST_SOURCES}
   ${ISAAC_RUNTIME_SOURCES}
@@ -214,6 +357,13 @@ endif()
 set_property(SOURCE "${ISAAC_RUNTIME}/guest.c" APPEND PROPERTY
   COMPILE_DEFINITIONS GUEST_GENERATION_SYMBOL=${ISAAC_GENERATION_SYMBOL}
     ISAAC_VITA_IMPORT_ID_DISPATCH=1)
+
+if(ISAAC_FRAME_SPIKE_LOG)
+  target_link_options(isaac-linux64 PRIVATE -Wl,--wrap=SDL_GL_SwapWindow)
+endif()
+foreach(ISAAC_WRAP_SYMBOL IN LISTS ISAAC_WRAP_SYMBOLS)
+  target_link_options(isaac-linux64 PRIVATE -Wl,--wrap=${ISAAC_WRAP_SYMBOL})
+endforeach()
 
 find_package(Threads REQUIRED)
 target_link_libraries(isaac-linux64 PRIVATE Threads::Threads m)

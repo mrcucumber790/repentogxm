@@ -17,7 +17,7 @@
 #define ISAAC_NP_LZ_HAS_NEON 1
 #else
 #define ISAAC_NP_LZ_HAS_NEON 0
-#if defined(__vita__)
+#if defined(__vita__) && defined(__arm__)
 #error "Native PNG LZ NEON requires the target ARM NEON contract"
 #endif
 #endif

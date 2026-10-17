@@ -131,7 +131,7 @@ static inline int isaac_png_premultiply_uniform16(uint8_t *pixel)
 }
 #else
 #define ISAAC_PNG_PREMULTIPLY_NEON_AVAILABLE 0
-#if ISAAC_VITA_PNG_PREMULTIPLY_NEON && defined(__vita__)
+#if ISAAC_VITA_PNG_PREMULTIPLY_NEON && defined(__vita__) && defined(__arm__)
 #error PNG premultiply NEON requires the target ARM NEON contract
 #endif
 #endif
