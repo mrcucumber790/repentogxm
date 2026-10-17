@@ -228,6 +228,13 @@ int kage_pc_backend_initialize(uint32_t width, uint32_t height)
     }
     /* The game is written against a legacy (compatibility) context: client
      * vertex arrays, glAlphaFunc, GLSL 1.10/1.20. */
+#if defined(__SWITCH__)
+    /* The Switch SDL port defaults to an OpenGL ES context; libepoxy in the
+     * game then finds no desktop GL provider and aborts. Mesa on the Switch
+     * also offers desktop GL, so ask for it explicitly. */
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                        SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+#endif
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
