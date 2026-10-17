@@ -11,7 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
+#include "host_tid.h"
 #include <time.h>
 #include <unistd.h>
 
@@ -63,7 +63,7 @@ int isaac_vita_get_win32_filetime(uint64_t *filetime)
 
 uint32_t isaac_vita_get_thread_id(void)
 {
-    return (uint32_t)syscall(SYS_gettid);
+    return (uint32_t)isaac_host_tid();
 }
 
 uint32_t isaac_vita_get_process_id(void) { return (uint32_t)getpid(); }
@@ -96,7 +96,7 @@ void isaac_vita_log(const char *format, ...)
     line_length = snprintf(line, sizeof(line), "[%u.%03u thr 0x%x] %s\n",
                            (unsigned)(t / 1000000u),
                            (unsigned)((t / 1000u) % 1000u),
-                           (unsigned)syscall(SYS_gettid), body);
+                           (unsigned)isaac_host_tid(), body);
     if (line_length <= 0)
         return;
     if (line_length >= (int)sizeof(line))

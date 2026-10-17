@@ -29,7 +29,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(__SWITCH__)
 #include <sys/mman.h>
+#endif
 #include <unistd.h>
 
 #define WINDOW_SIZE      (UINT64_C(1) << 32)
@@ -49,10 +51,26 @@
 #define FOOTERS 0
 #define INSECURE 0
 #define ABORT_ON_ASSERT_FAILURE 1
+#if defined(__SWITCH__)
+#define malloc_getpagesize ((size_t)4096U)
+#endif
 #include "third_party/dlmalloc.c"
+
+/* Arena layout (guest_window_init_arena): one caller-provided read/write
+ * block holds the image reserve at GUEST_IMAGE_BASE and the heap above it.
+ * Guest addresses outside it are not backed.  Used where the host cannot
+ * reserve address space cheaply (Switch: the libnx heap). */
+#ifndef GUEST_IMAGE_BASE
+#define GUEST_IMAGE_BASE 0x98000000u
+#endif
+#define ARENA_IMAGE_RESERVE UINT32_C(0x01000000)
+#define ARENA_GUEST_END     UINT32_C(0xf0000000)
 
 uintptr_t g_guest_mem_base;
 static mspace s_heap;
+static uint32_t s_fixed_start = HEAP_GUEST_END;
+static uint32_t s_fixed_end = UINT32_C(0xffffffff);
+static int s_arena;
 
 static void window_die(const char *message)
 {
@@ -67,14 +85,43 @@ static inline void window_ready(void)
         (void)guest_window_init();
 }
 
+#if defined(__SWITCH__)
+/* libnx hands the whole process heap to newlib; this file replaces newlib's
+ * allocator, so the heap becomes the guest arena. */
+extern char *fake_heap_start;
+extern char *fake_heap_end;
+
+int guest_window_init(void)
+{
+    if (g_guest_mem_base)
+        return 0;
+    return guest_window_init_arena(fake_heap_start,
+                                   (size_t)(fake_heap_end - fake_heap_start));
+}
+#else
 int guest_window_init(void)
 {
     uintptr_t want;
     void *window = MAP_FAILED;
     void *heap;
+    const char *arena_mb;
 
     if (g_guest_mem_base)
         return 0;
+    /* Test hook for the Switch layout on Linux: an unaligned arena. */
+    arena_mb = getenv("ISAAC_WINDOW_ARENA_MB");
+    if (arena_mb && atoi(arena_mb) > 0) {
+        size_t size = (size_t)atoi(arena_mb) << 20;
+        void *arena = mmap(NULL, size + 0x1000u, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                           -1, 0);
+        if (arena == MAP_FAILED) {
+            window_die("guest window: cannot map arena\n");
+            return -1;
+        }
+        /* Deliberately not 4 GiB aligned. */
+        return guest_window_init_arena((char *)arena + 0x10, size);
+    }
 
     /* Prefer a fixed 4 GiB-aligned spot; fall back to over-reserving and
      * trimming to an aligned 4 GiB. */
@@ -120,6 +167,41 @@ int guest_window_init(void)
     }
     return 0;
 }
+#endif
+
+int guest_window_init_arena(void *arena, size_t size)
+{
+    uintptr_t start = ((uintptr_t)arena + 0xfffu) & ~(uintptr_t)0xfffu;
+    uint64_t usable;
+    uint32_t heap_start = GUEST_IMAGE_BASE + ARENA_IMAGE_RESERVE;
+
+    if (g_guest_mem_base)
+        return 0;
+    if (!arena || start - (uintptr_t)arena >= size ||
+            start < (uintptr_t)GUEST_IMAGE_BASE) {
+        window_die("guest window: unusable arena\n");
+        return -1;
+    }
+    usable = size - (start - (uintptr_t)arena);
+    if (usable > (uint64_t)(ARENA_GUEST_END - GUEST_IMAGE_BASE))
+        usable = ARENA_GUEST_END - GUEST_IMAGE_BASE;
+    if (usable < (uint64_t)ARENA_IMAGE_RESERVE + UINT64_C(0x04000000)) {
+        window_die("guest window: arena too small\n");
+        return -1;
+    }
+    g_guest_mem_base = start - GUEST_IMAGE_BASE;
+    s_fixed_start = GUEST_IMAGE_BASE;
+    s_fixed_end = heap_start;
+    s_arena = 1;
+    s_heap = create_mspace_with_base(GUEST_HOST(heap_start),
+                                     (size_t)(usable - ARENA_IMAGE_RESERVE),
+                                     1);
+    if (!s_heap) {
+        window_die("guest window: mspace creation failed\n");
+        return -1;
+    }
+    return 0;
+}
 
 int guest_window_contains(const void *p, size_t size)
 {
@@ -131,22 +213,27 @@ int guest_window_contains(const void *p, size_t size)
 void *guest_window_map_fixed(uint32_t address, uint32_t size)
 {
     void *p = GUEST_HOST(address);
-    if (!g_guest_mem_base || (uint64_t)address + size > WINDOW_SIZE ||
-        (address < HEAP_GUEST_END && address + (uint64_t)size >
-                                         HEAP_GUEST_START))
+    if (!g_guest_mem_base || address < s_fixed_start ||
+        (uint64_t)address + size > s_fixed_end)
         return NULL;
-    if (mprotect(p, size, PROT_READ | PROT_WRITE) != 0)
+#if !defined(__SWITCH__)
+    if (!s_arena && mprotect(p, size, PROT_READ | PROT_WRITE) != 0)
         return NULL;
+#endif
     memset(p, 0, size);
     return p;
 }
 
 void guest_window_unmap_fixed(void *p, uint32_t size)
 {
+    if (s_arena)
+        return;
+#if !defined(__SWITCH__)
     if (p && guest_window_contains(p, size)) {
         madvise(p, size, MADV_DONTNEED);
         mprotect(p, size, PROT_NONE);
     }
+#endif
 }
 
 void *guest_window_malloc(size_t size)
@@ -218,3 +305,4 @@ void *pvalloc(size_t size)
     return guest_window_memalign(4096u, (size + 4095u) & ~(size_t)4095u);
 }
 size_t malloc_usable_size(void *p) { return guest_window_usable_size(p); }
+

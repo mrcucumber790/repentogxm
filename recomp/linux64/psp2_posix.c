@@ -15,7 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
+#include "host_tid.h"
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -138,6 +141,7 @@ int sceIoGetstatByFd(SceUID fd, SceIoStat *out)
 static struct {
     DIR *dir;
     int dirfd_valid;
+    char path[512];
 } s_dirs[DIR_SLOTS];
 static pthread_mutex_t s_dir_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -151,6 +155,7 @@ SceUID sceIoDopen(const char *dirname)
     for (i = 0; i < DIR_SLOTS; i++) {
         if (!s_dirs[i].dir) {
             s_dirs[i].dir = d;
+            snprintf(s_dirs[i].path, sizeof s_dirs[i].path, "%s", dirname);
             pthread_mutex_unlock(&s_dir_lock);
             return DIR_ID_BASE + i;
         }
@@ -181,8 +186,19 @@ int sceIoDread(SceUID fd, SceIoDirent *out)
     } while (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."));
     memset(out, 0, sizeof *out);
     snprintf(out->d_name, sizeof out->d_name, "%s", e->d_name);
+#if defined(__SWITCH__)
+    {
+        /* newlib has no fstatat/dirfd. */
+        char full[1024];
+        snprintf(full, sizeof full, "%s/%s",
+                 s_dirs[fd - DIR_ID_BASE].path, e->d_name);
+        if (stat(full, &st) == 0)
+            stat_from_posix(&out->d_stat, &st);
+    }
+#else
     if (fstatat(dirfd(d), e->d_name, &st, 0) == 0)
         stat_from_posix(&out->d_stat, &st);
+#endif
     return 1;
 }
 
@@ -220,7 +236,7 @@ int sceKernelExitProcess(int res)
 
 SceUID sceKernelGetProcessId(void) { return (SceUID)getpid(); }
 
-int sceKernelGetThreadId(void) { return (int)syscall(SYS_gettid); }
+int sceKernelGetThreadId(void) { return (int)isaac_host_tid(); }
 
 int sceKernelDelayThread(SceUInt delay)
 {
@@ -496,8 +512,18 @@ int sceRtcSetTime64_t(SceDateTime *t, SceUInt64 unix_seconds)
 int sceRtcConvertUtcToLocalTime(const SceRtcTick *utc, SceRtcTick *local)
 {
     time_t secs = (time_t)((utc->tick - RTC_UNIX_EPOCH_TICK) / 1000000u);
+#if defined(__SWITCH__)
+    TimeCalendarTime calendar;
+    TimeCalendarAdditionalInfo info;
+    int64_t offset = 0;
+    if (R_SUCCEEDED(timeToCalendarTimeWithMyRule((u64)secs, &calendar,
+                                                 &info)))
+        offset = info.offset;
+    local->tick = utc->tick + (SceUInt64)(offset * 1000000);
+#else
     struct tm tm;
     localtime_r(&secs, &tm);
     local->tick = utc->tick + (SceUInt64)((int64_t)tm.tm_gmtoff * 1000000);
+#endif
     return 0;
 }

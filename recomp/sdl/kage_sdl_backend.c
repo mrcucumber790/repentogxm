@@ -214,6 +214,12 @@ int kage_pc_backend_initialize(uint32_t width, uint32_t height)
         return 1;
     if (size)
         sscanf(size, "%dx%d", &window_w, &window_h);
+#if defined(__SWITCH__)
+    /* Full screen; SDL scales to the docked output. */
+    window_w = 1280;
+    window_h = 720;
+    flags = SDL_WINDOW_OPENGL;
+#endif
     if (s_kage.mode == KAGE_PC_BACKEND_HIDDEN)
         flags |= SDL_WINDOW_HIDDEN;
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {

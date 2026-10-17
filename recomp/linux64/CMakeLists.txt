@@ -62,7 +62,13 @@ set(ISAAC_RUNTIME_SOURCES
 # (manual_kage.c, gl_pc_backend.c), or inert hooks for the first-fault stage.
 option(ISAAC_SDL "SDL2/OpenGL renderer" ON)
 if(ISAAC_SDL)
-  find_package(SDL2 REQUIRED)
+  if(NINTENDO_SWITCH)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(ISAAC_NX_SDL2 REQUIRED IMPORTED_TARGET sdl2)
+    add_library(SDL2::SDL2 ALIAS PkgConfig::ISAAC_NX_SDL2)
+  else()
+    find_package(SDL2 REQUIRED)
+  endif()
   list(APPEND ISAAC_RUNTIME_SOURCES
     "${ISAAC_RUNTIME}/manual_kage.c"
     "${ISAAC_RUNTIME}/gl_pc_backend.c"
@@ -73,12 +79,24 @@ else()
     "${ISAAC_RUNTIME}/manual_kage_disabled.c")
 endif()
 
-set(ISAAC_HOST_SOURCES
-  main_linux.c
-  platform_linux.c
-  psp2_posix.c
-  guest_window.c
-  linux_stubs.c)
+if(NINTENDO_SWITCH)
+  # Same host layer on libnx/newlib; ../switch adds the entry point and the
+  # ux0:/app0: path devices over sdmc:/switch/isaac.
+  set(ISAAC_HOST_SOURCES
+    ../switch/main_switch.c
+    ../switch/switch_paths.c
+    ../switch/switch_malloc.c
+    platform_linux.c
+    psp2_posix.c
+    guest_window.c)
+else()
+  set(ISAAC_HOST_SOURCES
+    main_linux.c
+    platform_linux.c
+    psp2_posix.c
+    guest_window.c
+    linux_stubs.c)
+endif()
 
 # Lua 5.3.3 (the game's Lua5.3.3r.dll) built natively; mods need it.
 set(ISAAC_LUA53_SOURCE_DIR "" CACHE PATH "extracted lua-5.3.3 source root")
@@ -102,7 +120,13 @@ if(ISAAC_AUDIO)
   if(NOT ISAAC_SDL)
     message(FATAL_ERROR "ISAAC_AUDIO needs ISAAC_SDL (manual_kage.c)")
   endif()
-  find_package(OpenAL REQUIRED)
+  if(NINTENDO_SWITCH)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(ISAAC_NX_OPENAL REQUIRED IMPORTED_TARGET openal)
+    add_library(OpenAL::OpenAL ALIAS PkgConfig::ISAAC_NX_OPENAL)
+  else()
+    find_package(OpenAL REQUIRED)
+  endif()
   list(APPEND ISAAC_RUNTIME_SOURCES
     "${ISAAC_RUNTIME}/host_vita_audio.c"
     "${ISAAC_RUNTIME}/host_vita_audio_cooperative.c")
@@ -123,6 +147,7 @@ add_executable(isaac-linux64
 # Order matters: our platform.h shadows recomp/vita/platform.h.
 target_include_directories(isaac-linux64 PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../switch"
   "${CMAKE_CURRENT_SOURCE_DIR}/compat"
   "${ISAAC_RUNTIME}"
   "${ISAAC_VITA}"
@@ -169,4 +194,17 @@ if(ISAAC_LUA)
 endif()
 if(ISAAC_AUDIO)
   target_link_libraries(isaac-linux64 PRIVATE OpenAL::OpenAL)
+endif()
+
+if(NINTENDO_SWITCH)
+  # SDL2's Switch port (mesa) and OpenAL Soft are C++: link with the C++
+  # driver so libstdc++ comes last.
+  enable_language(CXX)
+  set_target_properties(isaac-linux64 PROPERTIES LINKER_LANGUAGE CXX)
+  set_target_properties(isaac-linux64 PROPERTIES OUTPUT_NAME isaac)
+  nx_generate_nacp(isaac.nacp
+    NAME "The Binding of Isaac: Repentance"
+    AUTHOR "repentogxm port"
+    VERSION "1.7.9b")
+  nx_create_nro(isaac-linux64 OUTPUT isaac.nro NACP isaac.nacp NOICON)
 endif()

@@ -12,6 +12,9 @@ extern "C" {
 
 /* Reserve the 4 GiB window and create the guest heap.  0 on success. */
 int guest_window_init(void);
+/* Alternative: use [arena, arena+size) (read/write, any alignment) for the
+ * image reserve at GUEST_IMAGE_BASE and the heap above it. */
+int guest_window_init_arena(void *arena, size_t size);
 int guest_window_contains(const void *p, size_t size);
 
 /* Make [address, address+size) of the window usable (the PE image). */
