@@ -9,9 +9,15 @@
 
 #include <SDL.h>
 
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+void isaac_vita_log(const char *format, ...);
 
 #ifndef KAGE_SDL_DEFAULT_SCALE
 #define KAGE_SDL_DEFAULT_SCALE 1
@@ -116,6 +122,63 @@ static int glfw_key_from_scancode(SDL_Scancode code)
  * (WASD), face buttons shoot (arrows), RB item (Space), LB bomb (E), RT card
  * (Q), LT drop (Left Ctrl), Back map (Tab), Start pause (Esc), right-stick
  * click confirm (Enter). */
+#if defined(__SWITCH__)
+/* Switch: read the controller through libnx so buttons are positional and
+ * independent of SDL's label mapping.  Left stick/d-pad move (WASD), right
+ * stick shoots (arrows), A confirms (Enter), B goes back (Esc), R item
+ * (Space), L or X bomb (E), ZR or Y card (Q), ZL drop (Left Ctrl), - map
+ * (Tab), + pause (Esc). */
+static PadState s_switch_pad;
+static int s_switch_pad_ready;
+
+static void kage_sdl_pad_keys(uint8_t keys[KAGE_PC_KEY_COUNT])
+{
+    u64 held;
+    HidAnalogStickState ls, rs;
+    const int dz = 12000;
+
+    if (!s_switch_pad_ready) {
+        padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+        padInitializeDefault(&s_switch_pad);
+        s_switch_pad_ready = 1;
+    }
+    padUpdate(&s_switch_pad);
+    held = padGetButtons(&s_switch_pad);
+    ls = padGetStickPos(&s_switch_pad, 0);
+    rs = padGetStickPos(&s_switch_pad, 1);
+    /* libnx sticks: +y is up. */
+    if ((held & HidNpadButton_Up) || ls.y > dz)
+        keys['W'] = 1;
+    if ((held & HidNpadButton_Down) || ls.y < -dz)
+        keys['S'] = 1;
+    if ((held & HidNpadButton_Left) || ls.x < -dz)
+        keys['A'] = 1;
+    if ((held & HidNpadButton_Right) || ls.x > dz)
+        keys['D'] = 1;
+    if (rs.y > dz)
+        keys[GLFW_KEY_UP] = 1;
+    if (rs.y < -dz)
+        keys[GLFW_KEY_DOWN] = 1;
+    if (rs.x < -dz)
+        keys[GLFW_KEY_LEFT] = 1;
+    if (rs.x > dz)
+        keys[GLFW_KEY_RIGHT] = 1;
+    if (held & HidNpadButton_A)
+        keys[GLFW_KEY_ENTER] = 1;
+    if (held & (HidNpadButton_B | HidNpadButton_Plus))
+        keys[GLFW_KEY_ESCAPE] = 1;
+    if (held & HidNpadButton_R)
+        keys[GLFW_KEY_SPACE] = 1;
+    if (held & (HidNpadButton_L | HidNpadButton_X))
+        keys['E'] = 1;
+    if (held & (HidNpadButton_ZR | HidNpadButton_Y))
+        keys['Q'] = 1;
+    if (held & HidNpadButton_ZL)
+        keys[GLFW_KEY_LEFT_CONTROL] = 1;
+    if (held & HidNpadButton_Minus)
+        keys[GLFW_KEY_TAB] = 1;
+}
+#else
 static void kage_sdl_pad_keys(uint8_t keys[KAGE_PC_KEY_COUNT])
 {
     SDL_GameController *pad = s_kage.pad;
@@ -160,6 +223,7 @@ static void kage_sdl_pad_keys(uint8_t keys[KAGE_PC_KEY_COUNT])
 #undef PAD
 #undef AXIS
 }
+#endif
 
 static void kage_sdl_pump(void)
 {
@@ -307,6 +371,43 @@ void kage_pc_backend_shutdown(void)
     s_kage.ready = 0;
 }
 
+#if defined(__SWITCH__)
+/* main_switch.c raises the CPU clock for the initial load; drop it once the
+ * game renders steadily (boost mode lowers the GPU clock).  Also log the
+ * frame rate now and then. */
+static void kage_sdl_switch_frame_note(void)
+{
+    static Uint64 last, window_start;
+    static unsigned steady, window_frames;
+    static int boosted = 1;
+    Uint64 now = SDL_GetPerformanceCounter();
+    Uint64 freq = SDL_GetPerformanceFrequency();
+
+    if (boosted) {
+        if (last && now - last < freq / 10u)
+            ++steady;
+        else
+            steady = 0;
+        if (steady >= 60u) {
+            appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+            boosted = 0;
+            isaac_vita_log("isaac-switch: steady frames, CPU boost off");
+        }
+    }
+    last = now;
+    if (!window_start)
+        window_start = now;
+    if (++window_frames == 600u) {
+        double seconds = (double)(now - window_start) / (double)freq;
+        isaac_vita_log("isaac-switch: %.1f fps over %u frames",
+                       seconds > 0.0 ? window_frames / seconds : 0.0,
+                       window_frames);
+        window_start = now;
+        window_frames = 0u;
+    }
+}
+#endif
+
 int kage_pc_backend_present(void)
 {
     int w, h;
@@ -322,6 +423,9 @@ int kage_pc_backend_present(void)
     s_kage.width = (uint32_t)w;
     s_kage.height = (uint32_t)h;
     s_kage.presents++;
+#if defined(__SWITCH__)
+    kage_sdl_switch_frame_note();
+#endif
     if (s_kage.close_requested) {
         snprintf(s_kage.error, sizeof s_kage.error,
                  "KAGE SDL backend: window close requested");

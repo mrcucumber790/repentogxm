@@ -92,6 +92,9 @@ int main(int argc, char **argv)
                    "(hold R while launching a game), not from the album.");
         return 1;
     }
+    /* Faster CPU for the initial resource load; the SDL backend turns it
+     * off once frames come steadily. */
+    appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
     isaac_vita_log_reset();
     isaac_vita_log("isaac-switch: arena=%p..%p guest base=0x%08x pe=%s",
                    (void *)fake_heap_start, (void *)fake_heap_end,

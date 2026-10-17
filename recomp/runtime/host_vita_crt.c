@@ -3776,6 +3776,15 @@ static void vita_crt_fopen(CPU *__restrict c)
         vita_crt_cdecl_return(c);
         return;
     }
+#if defined(__SWITCH__)
+    /* The game never flushes log.txt and a Switch app is usually closed from
+     * HOME, which drops stdio buffers: keep the log line buffered. */
+    if (stream) {
+        size_t length = strlen(native_path);
+        if (length >= 7U && !strcmp(native_path + length - 7U, "log.txt"))
+            setvbuf(stream, NULL, _IOLBF, BUFSIZ);
+    }
+#endif
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
     if (opened_entry.file.key[0]) {
         errno = 0;
