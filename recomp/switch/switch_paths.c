@@ -7,6 +7,7 @@
  * rewriting the path:
  *
  *   ux0:/data/isaacr001/X, ux0:data/isaacr001/X  -> sdmc:/switch/isaac/X
+ *   ux0:/data                                  -> sdmc:/switch/isaac
  *   ux0:/Y                                     -> sdmc:/switch/isaac/ux0/Y
  *   app0:/X                                    -> sdmc:/switch/isaac/X
  */
@@ -38,6 +39,10 @@ static int rewrite(struct _reent *r, const char *path, char *out, size_t size)
         ++rest;
     if (colon - path == 4 && strncmp(path, "app0", 4) == 0) {
         n = snprintf(out, size, ROOT "/%s", rest);
+    } else if (strcmp(rest, "data") == 0 || strcmp(rest, "data/") == 0) {
+        /* The game creates every component of its save path, starting with
+         * "ux0:/data"; that must exist, or it never opens log.txt. */
+        n = snprintf(out, size, ROOT);
     } else if (strncmp(rest, "data/isaacr001", 14) == 0 &&
                (rest[14] == '\0' || rest[14] == '/')) {
         rest += 14;
