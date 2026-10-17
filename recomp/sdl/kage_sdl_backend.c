@@ -392,8 +392,16 @@ int kage_pc_backend_initialize(uint32_t width, uint32_t height)
         return 0;
     }
     SDL_GL_MakeCurrent(s_kage.window, s_kage.context);
+#if defined(__SWITCH__)
+    /* The console's display is fixed at 60 Hz: present on vblank.  Without
+     * it the game's own limiter toggles off after a few slow frames and the
+     * frame rate swings between ~50 and ~75 fps (uneven motion). */
+    SDL_GL_SetSwapInterval(1);
+    s_kage.vsync = 1;
+#else
     SDL_GL_SetSwapInterval(0);
     s_kage.vsync = 0;
+#endif
     SDL_GL_GetDrawableSize(s_kage.window, &drawable_w, &drawable_h);
     s_kage.width = (uint32_t)drawable_w;
     s_kage.height = (uint32_t)drawable_h;
@@ -717,6 +725,9 @@ int kage_pc_backend_set_vsync(int enabled)
 {
     if (!s_kage.ready)
         return 0;
+#if defined(__SWITCH__)
+    enabled = 1; /* always on, see kage_pc_backend_initialize */
+#endif
     if (SDL_GL_SetSwapInterval(enabled ? 1 : 0) != 0) {
         kage_sdl_error("SDL_GL_SetSwapInterval");
         return 0;
