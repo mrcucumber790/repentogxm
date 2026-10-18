@@ -102,6 +102,7 @@ int main(int argc, char **argv)
     appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
     isaac_vita_log_reset();
     switch_bg_start();
+    isaac_vita_log("isaac-switch: port version %s", ISAAC_SWITCH_PORT_VERSION);
     isaac_vita_log("isaac-switch: arena=%p..%p guest base=0x%08x pe=%s",
                    (void *)fake_heap_start, (void *)fake_heap_end,
                    (unsigned)GUEST_IMAGE_BASE, pe);

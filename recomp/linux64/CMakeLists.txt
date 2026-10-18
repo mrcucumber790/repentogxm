@@ -96,6 +96,10 @@ if(ISAAC_CXX_EH)
   list(APPEND ISAAC_RUNTIME_SOURCES "${ISAAC_RUNTIME}/guest_cxx_eh.c")
 endif()
 
+# Version of the Switch port build (release zip isaac-switch-v<ver>.zip,
+# hbmenu entry, first line of first-arm-fault.log).  Bump for every release.
+set(ISAAC_SWITCH_PORT_VERSION "0.3.0")
+
 if(NINTENDO_SWITCH)
   # Same host layer on libnx/newlib; ../switch adds the entry point and the
   # ux0:/app0: path devices over sdmc:/switch/isaac.
@@ -501,6 +505,7 @@ target_include_directories(isaac-linux64 PRIVATE
 
 target_compile_definitions(isaac-linux64 PRIVATE
   __vita__=1
+  ISAAC_SWITCH_PORT_VERSION="${ISAAC_SWITCH_PORT_VERSION}"
   GUEST_MEM_WINDOW=1
   GUEST_IMAGE_BASE=${ISAAC_GUEST_BASE}u
   GUEST_STACK_REQUIRED=1
@@ -568,6 +573,6 @@ if(NINTENDO_SWITCH)
   nx_generate_nacp(isaac.nacp
     NAME "The Binding of Isaac: Repentance"
     AUTHOR "repentogxm port"
-    VERSION "1.7.9b")
+    VERSION "${ISAAC_SWITCH_PORT_VERSION}")
   nx_create_nro(isaac-linux64 OUTPUT isaac.nro NACP isaac.nacp NOICON)
 endif()
