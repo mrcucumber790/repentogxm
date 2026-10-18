@@ -90,5 +90,8 @@
  * FALLBACK lines on power-of-two counts only. */
 
 void isaac_native_vorbis_report(const char *why);
+/* Decode active music streams ahead; once per main loop iteration on the
+ * game thread (weak-referenced by the SDL backend). */
+void isaac_native_vorbis_tick(void);
 
 #endif

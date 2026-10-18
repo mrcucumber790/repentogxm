@@ -460,10 +460,8 @@ static Uint64 s_f_update, s_f_render, s_f_limiter, s_f_swap, s_mark_update;
 static int s_boosted = 1;
 static unsigned s_spikes;
 
-void isaac_vita_crt_flush_game_log(void);
-
 void switch_sampler_frame(uint64_t begin, uint64_t end, int slow);
-void switch_sampler_flush(void);
+void isaac_mod_probe_report(void);
 
 /* Called once per main loop iteration (at the game update): log frames over
  * 25 ms with where the time went (update = game logic, render = drawing
@@ -532,9 +530,7 @@ static void kage_sdl_switch_frame_note(void)
         window_start = now;
         window_frames = 0u;
         s_spikes = 0u;
-        isaac_vita_log_flush();
-        isaac_vita_crt_flush_game_log();
-        switch_sampler_flush();
+        isaac_mod_probe_report();
     }
 }
 #endif
@@ -577,10 +573,18 @@ int kage_pc_backend_present(void)
 
 void kage_pc_backend_note_loop_head(void) {}
 void kage_pc_backend_note_service_entry(void) {}
+/* host_native_vorbis64.c, when linked: decode music ahead a slice per
+ * frame instead of all at once at each refill. */
+void isaac_native_vorbis_tick(void) __attribute__((weak));
+
 void kage_pc_backend_note_update_entry(void)
 {
 #if defined(__SWITCH__)
     kage_sdl_switch_spike_note();
+#endif
+    if (isaac_native_vorbis_tick)
+        isaac_native_vorbis_tick();
+#if defined(__SWITCH__)
     s_mark_update = SDL_GetPerformanceCounter();
 #endif
 }

@@ -59,6 +59,15 @@ int isaac_vita_guest_free(void *pointer);
 #endif
 #ifndef NVW_ARENA_MAX
 #define NVW_ARENA_MAX              (4U * 1024U * 1024U)
+
+/* Stream prefetch.  The game refills a music stream 16384 frames at a time
+ * (every ~0.37 s), and decoding that in one go misses a vblank on the
+ * Switch.  Once a stream has delivered its first block, the frame tick
+ * (isaac_native_vorbis_tick) decodes it ahead in small slices, so a refill
+ * is a copy.  Capacity holds one refill plus a slice of headroom. */
+#define NVW_PF_FRAMES              (32768U)
+#define NVW_PF_TARGET              (24576U)
+#define NVW_PF_SLICE               (1024U)
 #endif
 
 /* ------------------------------------------------------------------------
@@ -153,6 +162,18 @@ typedef struct nvw_mirror {
     nvw_io *io;
     uint32_t post_open_pos;     /* guest stream position after the real open */
     uint64_t delivered;         /* frames since the last sync point */
+    /* stream prefetch: frames decoded ahead at the frame tick, in the
+     * channel layout of the last get_samples call */
+    int16_t *pf_buf;
+    uint32_t pf_head;           /* first buffered frame */
+    uint32_t pf_len;            /* buffered frames */
+    int pf_channels;
+    int pf_eof;
+    int pf_err;
+    /* ISAAC_NATIVE_VORBIS_PF_CRC: checksum of the first frames delivered */
+    uint32_t crc;
+    uint32_t crc_frames;
+    uint32_t serial;
 } nvw_mirror;
 
 typedef struct nvw_stats {
@@ -171,6 +192,10 @@ typedef struct nvw_stats {
     uint32_t arena_used_max, arena_retry;
     uint32_t threads, foreign_calls;
     uint32_t fallbacks;
+    /* prefetch */
+    uint32_t pf_ticks, pf_slices, pf_drop, pf_errors;
+    uint64_t pf_frames, pf_served, pf_us;
+    uint32_t pf_us_max;
     /* verify */
     uint32_t v_mirrors, v_calls, v_match, v_count_diff, v_sample_diff;
     uint64_t v_diff_samples;
@@ -189,6 +214,8 @@ static int s_first_thread_set;
 static uint32_t s_marker_seq;
 static uint32_t s_staging;              /* guest block for stream reads */
 static CPU *s_io_cpu;                   /* set only around native calls */
+static CPU *s_tick_cpu;                 /* the CPU of the last stream call */
+static pthread_t s_tick_thread;
 static jmp_buf s_jmp;
 static int s_jmp_armed;
 static int s_verify_budget = -1;        /* -1: not read yet */
@@ -542,6 +569,7 @@ static void nvw_destroy(nvw_mirror *m)
         __atomic_sub_fetch(&s_live, 1U, __ATOMIC_RELEASE);
     free(m->arena);
     free(m->io);
+    free(m->pf_buf);
     memset(m, 0, sizeof *m);
 }
 
@@ -744,6 +772,172 @@ static int nvw_native_seek_start(CPU *__restrict c, nvw_mirror *m)
 }
 
 /* ------------------------------------------------------------------------
+ * Stream prefetch (see NVW_PF_FRAMES).  ISAAC_NATIVE_VORBIS_PF=0 turns it
+ * off; ISAAC_NATIVE_VORBIS_PF_CRC=<n> logs a checksum of the first n frames
+ * each stream delivers, for A/B runs. */
+static uint32_t nvw_crc32(uint32_t crc, const uint8_t *p, size_t n);
+
+static int nvw_pf_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *e = getenv("ISAAC_NATIVE_VORBIS_PF");
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled;
+}
+
+static uint32_t nvw_pf_crc_frames(void)
+{
+    static int64_t frames = -1;
+
+    if (frames < 0) {
+        const char *e = getenv("ISAAC_NATIVE_VORBIS_PF_CRC");
+        frames = e ? atoll(e) : 0;
+        if (frames < 0)
+            frames = 0;
+    }
+    return (uint32_t)frames;
+}
+
+static void nvw_pf_crc_note(nvw_mirror *m, const short *pcm, int frames,
+                            int channels)
+{
+    uint32_t limit = nvw_pf_crc_frames();
+    uint32_t take;
+
+    if (!limit || m->crc_frames >= limit || frames <= 0)
+        return;
+    take = limit - m->crc_frames;
+    if (take > (uint32_t)frames)
+        take = (uint32_t)frames;
+    m->crc = nvw_crc32(m->crc, (const uint8_t *)pcm,
+                       (size_t)take * (uint32_t)channels * sizeof(short));
+    m->crc_frames += take;
+    if (m->crc_frames == limit)
+        isaac_vita_log("KAGE NATIVE VORBIS PF CRC: stream=%u frames=%u "
+                       "crc=%08x", (unsigned)m->serial, (unsigned)limit,
+                       (unsigned)m->crc);
+}
+static void nvw_pf_reset(nvw_mirror *m)
+{
+    m->pf_head = 0U;
+    m->pf_len = 0U;
+    m->pf_eof = 0;
+}
+
+/* Move up to num_shorts / channels buffered frames to out. */
+static int nvw_pf_take(nvw_mirror *m, int channels, short *out,
+                       int num_shorts)
+{
+    uint32_t take;
+
+    if (!m->pf_len)
+        return 0;
+    if (channels != m->pf_channels) {
+        /* never seen; the decoded layout cannot be reused */
+        ++s_st.pf_drop;
+        nvw_pf_reset(m);
+        m->pf_err = 1;
+        return 0;
+    }
+    take = (uint32_t)(num_shorts / channels);
+    if (take > m->pf_len)
+        take = m->pf_len;
+    memcpy(out, m->pf_buf + (size_t)m->pf_head * (uint32_t)channels,
+           (size_t)take * (uint32_t)channels * sizeof(int16_t));
+    m->pf_head += take;
+    m->pf_len -= take;
+    if (!m->pf_len)
+        m->pf_head = 0U;
+    s_st.pf_served += take;
+    return (int)take;
+}
+
+/* Decode one slice ahead for m.  Returns 1 when a slice was decoded. */
+static int nvw_pf_fill(CPU *__restrict c, nvw_mirror *m)
+{
+    uint32_t ch = (uint32_t)m->pf_channels;
+    uint64_t t0, dt;
+    int ok = 0;
+    int n;
+
+    if (!m->pf_buf) {
+        m->pf_buf = (int16_t *)malloc((size_t)NVW_PF_FRAMES * ch *
+                                      sizeof(int16_t));
+        if (!m->pf_buf) {
+            m->pf_err = 1;
+            return 0;
+        }
+    }
+    if (m->pf_head + m->pf_len + NVW_PF_SLICE > NVW_PF_FRAMES) {
+        memmove(m->pf_buf, m->pf_buf + (size_t)m->pf_head * ch,
+                (size_t)m->pf_len * ch * sizeof(int16_t));
+        m->pf_head = 0U;
+    }
+    t0 = nvw_now_us();
+    n = nvw_native_samples(c, m, (int)ch,
+                           m->pf_buf + (size_t)(m->pf_head + m->pf_len) * ch,
+                           (int)(NVW_PF_SLICE * ch), &ok);
+    dt = nvw_now_us() - t0;
+    if (n < 0)
+        n = 0;
+    if (!ok) {
+        /* stop here; the next get_samples meets the error itself */
+        m->pf_err = 1;
+        ++s_st.pf_errors;
+    } else if ((uint32_t)n < NVW_PF_SLICE) {
+        m->pf_eof = 1;
+    }
+    m->pf_len += (uint32_t)n;
+    ++s_st.pf_slices;
+    s_st.pf_frames += (uint32_t)n;
+    s_st.pf_us += dt;
+    if (dt > s_st.pf_us_max)
+        s_st.pf_us_max = (uint32_t)dt;
+    return 1;
+}
+
+/* Once per main loop iteration, on the game thread, between guest calls.
+ * Stream reads go through the guest stream object, so this borrows the
+ * CPU of the last stream get_samples (same thread) and gives its register
+ * state back untouched. */
+void isaac_native_vorbis_tick(void)
+{
+    CPU *c = s_tick_cpu;
+    unsigned char saved[offsetof(CPU, fault)];
+    uint32_t saved_error;
+    uint32_t i;
+    unsigned slices = 0U;
+
+    if (!c || !__atomic_load_n(&s_live, __ATOMIC_ACQUIRE) || c->fault ||
+            !pthread_equal(pthread_self(), s_tick_thread) ||
+            nvw_test_loop_frames() || !nvw_pf_enabled())
+        return;
+    nvw_lock();
+    ++s_st.pf_ticks;
+    memcpy(saved, c, sizeof saved);
+    saved_error = c->last_error;
+    for (i = 0U; i < NVW_MIRRORS_MAX && slices < 2U; ++i) {
+        nvw_mirror *m = &s_mirrors[i];
+
+        if (!m->active || m->mode != NVW_MODE_STREAM || m->broken ||
+                m->verify || m->pf_err || m->pf_eof || !m->delivered ||
+                !m->pf_channels || m->pf_len >= NVW_PF_TARGET)
+            continue;
+        if (nvw_lookup(m->f) != m)
+            continue;
+        slices += (unsigned)nvw_pf_fill(c, m);
+        if (c->fault)
+            break;
+    }
+    memcpy(c, saved, sizeof saved);
+    c->last_error = saved_error;
+    nvw_unlock();
+}
+
+/* ------------------------------------------------------------------------
  * Wrapped guest entries. */
 void __real_sub_005bdf80(CPU *__restrict c);
 void __real_sub_005b7740(CPU *__restrict c);
@@ -760,7 +954,7 @@ static void nvw_finish_open(CPU *__restrict c, nvw_mirror *m, uint32_t f,
     if (m->mode == NVW_MODE_MEMORY)
         ++s_st.mirrors_mem;
     else
-        ++s_st.mirrors_stream;
+        m->serial = ++s_st.mirrors_stream;
     c->eax = eax;
     c->ecx = ecx;
     c->edx = edx;
@@ -1184,6 +1378,7 @@ void __wrap_sub_005bdf80(CPU *__restrict c)
     nvw_mirror *m;
     int ok = 0;
     int n;
+    int served;
     uint64_t t0, dt;
 
     if (!f || (f & 3U) || !__atomic_load_n(&s_live, __ATOMIC_ACQUIRE)) {
@@ -1231,12 +1426,25 @@ void __wrap_sub_005bdf80(CPU *__restrict c)
         (void)gpop(c);
         return;
     }
+    if (m->mode == NVW_MODE_STREAM) {
+        s_tick_cpu = c;
+        s_tick_thread = pthread_self();
+        if (!m->pf_len)
+            m->pf_channels = channels;
+    }
     t0 = nvw_now_us();
-    n = nvw_native_samples(c, m, channels, (short *)guest_ptr(buffer),
-                           num_shorts, &ok);
+    served = nvw_pf_take(m, channels, (short *)guest_ptr(buffer), num_shorts);
+    if (num_shorts - served * channels >= channels) {
+        n = nvw_native_samples(c, m, channels,
+                               (short *)guest_ptr(buffer) + served * channels,
+                               num_shorts - served * channels, &ok);
+    } else {
+        n = 0;
+        ok = 1;
+    }
     dt = nvw_now_us() - t0;
     if (!ok) {
-        if (m->delivered == 0U) {
+        if (m->delivered == 0U && !served) {
             /* nothing left the mirror: the guest state is exactly where
              * its open put it; put the stream back there too */
             ++s_st.clean_fallback;
@@ -1255,6 +1463,9 @@ void __wrap_sub_005bdf80(CPU *__restrict c)
         if (n < 0)
             n = 0;
     }
+    n += served;
+    if (m->mode == NVW_MODE_STREAM)
+        nvw_pf_crc_note(m, (const short *)guest_ptr(buffer), n, channels);
     m->delivered += (uint32_t)n;
     if (m->mode == NVW_MODE_MEMORY) {
         ++s_st.calls_mem;
@@ -1320,6 +1531,7 @@ void __wrap_sub_005b7740(CPU *__restrict c)
     }
     ++s_st.seek_start_native;
     m->delivered = 0U;
+    nvw_pf_reset(m);
     if (m->verify) {
         /* the guest decoder is authoritative: let it seek too */
         nvw_unlock();
@@ -1427,7 +1639,8 @@ void isaac_native_vorbis_report(const char *why)
         "pump_skip=%u open_fail=%u layout_fail=%u pool_full=%u clean_fb=%u "
         "broken_mid=%u broken_drop=%u asserts=%u io_err=%u retire_deinit=%u "
         "retire_freed=%u retire_dead=%u replaced=%u live=%u live_max=%u "
-        "arena_max=%u arena_retry=%u foreign=%u",
+        "arena_max=%u arena_retry=%u foreign=%u pf_slices=%u pf_ms=%llu "
+        "pf_max_us=%u pf_served=%llu pf_err=%u pf_drop=%u",
         w, (unsigned)s->seek_start_native, (unsigned)s->seek_start_real,
         (unsigned)s->pump_skipped, (unsigned)s->open_fail,
         (unsigned)s->layout_fail, (unsigned)s->pool_full,
@@ -1438,7 +1651,10 @@ void isaac_native_vorbis_report(const char *why)
         (unsigned)s->replaced,
         (unsigned)__atomic_load_n(&s_live, __ATOMIC_ACQUIRE),
         (unsigned)s->live_max, (unsigned)s->arena_used_max,
-        (unsigned)s->arena_retry, (unsigned)s->foreign_calls);
+        (unsigned)s->arena_retry, (unsigned)s->foreign_calls,
+        (unsigned)s->pf_slices, (unsigned long long)(s->pf_us / 1000U),
+        (unsigned)s->pf_us_max, (unsigned long long)s->pf_served,
+        (unsigned)s->pf_errors, (unsigned)s->pf_drop);
     if (s->v_mirrors || s_selftest.files)
         isaac_vita_log(
             "KAGE NATIVE VORBIS VERIFY: why=%s mirrors=%u calls=%u match=%u "

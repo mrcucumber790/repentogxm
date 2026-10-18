@@ -104,13 +104,16 @@ if(NINTENDO_SWITCH)
     ../switch/switch_paths.c
     ../switch/switch_malloc.c
     ../switch/switch_sampler.c
+    ../switch/switch_bg.c
     platform_linux.c
+    mod_probe_cache.c
     psp2_posix.c
     guest_window.c)
 else()
   set(ISAAC_HOST_SOURCES
     main_linux.c
     platform_linux.c
+    mod_probe_cache.c
     psp2_posix.c
     guest_window.c
     linux_stubs.c)

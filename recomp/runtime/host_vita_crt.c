@@ -23,6 +23,9 @@
 #if defined(ISAAC_VITA_CRT_SEEK_SHADOW)
 #include <sys/stat.h>
 #endif
+#if defined(__SWITCH__)
+#include <pthread.h>
+#endif
 
 #include "host_vita_crt.h"
 #if defined(ISAAC_VITA_CRT_ATOF_SMALLINT) && ISAAC_VITA_CRT_ATOF_SMALLINT
@@ -920,7 +923,11 @@ enum {
 
 static volatile uint32_t s_file_lock;
 #if defined(__SWITCH__)
+/* Guarded by its own mutex, not s_file_lock: a background thread flushes it
+ * (isaac_vita_crt_flush_game_log) and must not stall the game's file calls
+ * while the SD card write runs. */
 static FILE *s_switch_game_log;
+static pthread_mutex_t s_switch_game_log_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 #if defined(ISAAC_VITA_GAME_LOG_BATCH)
 static isaac_vita_crt_log_batch_snapshot s_log_batch = {
@@ -3374,10 +3381,10 @@ void isaac_vita_crt_flush_game_log(void)
 {
     int saved_errno = errno;
 
-    vita_crt_file_lock();
+    pthread_mutex_lock(&s_switch_game_log_lock);
     if (s_switch_game_log)
         (void)fflush(s_switch_game_log);
-    vita_crt_file_unlock();
+    pthread_mutex_unlock(&s_switch_game_log_lock);
     errno = saved_errno;
 }
 #endif
@@ -3805,13 +3812,15 @@ static void vita_crt_fopen(CPU *__restrict c)
     /* The game flushes log.txt after every record, and each flush is a
      * synchronous SD card write that stalls the frame (room transitions log
      * dozens of lines).  Buffer it fully and drop the game's own flushes;
-     * the SDL backend flushes it every few seconds instead
+     * a background thread flushes it every few seconds instead
      * (isaac_vita_crt_flush_game_log), so a HOME close loses only the tail. */
     if (stream) {
         size_t length = strlen(native_path);
         if (length >= 7U && !strcmp(native_path + length - 7U, "log.txt")) {
-            setvbuf(stream, NULL, _IOFBF, 64U * 1024U);
+            setvbuf(stream, NULL, _IOFBF, 256U * 1024U);
+            pthread_mutex_lock(&s_switch_game_log_lock);
             s_switch_game_log = stream;
+            pthread_mutex_unlock(&s_switch_game_log_lock);
         }
     }
 #endif
@@ -4132,8 +4141,11 @@ static void vita_crt_fclose(CPU *__restrict c)
 #endif
     errno = 0;
 #if defined(__SWITCH__)
-    if (stream == s_switch_game_log)
+    if (stream == s_switch_game_log) {
+        pthread_mutex_lock(&s_switch_game_log_lock);
         s_switch_game_log = NULL;
+        pthread_mutex_unlock(&s_switch_game_log_lock);
+    }
 #endif
 #if defined(ISAAC_VITA_ARCHIVE_FILE_CACHE)
 #if defined(ISAAC_VITA_IO_PROFILE)

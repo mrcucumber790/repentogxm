@@ -40,6 +40,7 @@ static const char *s_pe;
 static int s_result;
 
 void switch_sampler_start(void);
+void switch_bg_start(void);
 
 static void *game_thread(void *arg)
 {
@@ -100,6 +101,7 @@ int main(int argc, char **argv)
      * off once frames come steadily. */
     appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
     isaac_vita_log_reset();
+    switch_bg_start();
     isaac_vita_log("isaac-switch: arena=%p..%p guest base=0x%08x pe=%s",
                    (void *)fake_heap_start, (void *)fake_heap_end,
                    (unsigned)GUEST_IMAGE_BASE, pe);

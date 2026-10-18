@@ -396,6 +396,10 @@ static void vita_startup_FreeLibrary(CPU *__restrict c)
     vita_startup_stdcall_return(c, 4U);
 }
 
+#if defined(GUEST_MEM_WINDOW)
+int isaac_mod_probe_known_missing(const char *path);
+#endif
+
 static void vita_startup_GetFileAttributesA(CPU *__restrict c)
 {
     uint32_t path = vita_startup_arg(c, 0U);
@@ -408,6 +412,24 @@ static void vita_startup_GetFileAttributesA(CPU *__restrict c)
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
     /* Attribute probes must observe a save whose image is still queued. */
     isaac_vita_async_write_sync_path(native_path);
+#endif
+#if defined(GUEST_MEM_WINDOW)
+    /* Mod override probes for assets the mod does not have: answered from
+     * directory listings (linux64/mod_probe_cache.c). */
+    switch (isaac_mod_probe_known_missing(native_path)) {
+    case 0:
+        break;
+    case 1:
+        vita_startup_set_last_error(c, ISAAC_VITA_STARTUP_ERROR_FILE_NOT_FOUND);
+        c->eax = ISAAC_VITA_STARTUP_INVALID_FILE_ATTRIBUTES;
+        vita_startup_stdcall_return(c, 4U);
+        return;
+    default:
+        vita_startup_set_last_error(c, ISAAC_VITA_STARTUP_ERROR_PATH_NOT_FOUND);
+        c->eax = ISAAC_VITA_STARTUP_INVALID_FILE_ATTRIBUTES;
+        vita_startup_stdcall_return(c, 4U);
+        return;
+    }
 #endif
     if (stat(native_path, &information) != 0) {
         int native_error = errno;
