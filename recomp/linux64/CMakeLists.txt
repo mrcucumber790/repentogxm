@@ -105,6 +105,7 @@ if(NINTENDO_SWITCH)
     ../switch/switch_malloc.c
     ../switch/switch_sampler.c
     ../switch/switch_bg.c
+    ../switch/switch_clock.c
     platform_linux.c
     mod_probe_cache.c
     psp2_posix.c

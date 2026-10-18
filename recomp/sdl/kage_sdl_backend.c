@@ -462,6 +462,7 @@ static unsigned s_spikes;
 
 void switch_sampler_frame(uint64_t begin, uint64_t end, int slow);
 void isaac_mod_probe_report(void);
+void switch_clock_apply(void);
 
 /* Called once per main loop iteration (at the game update): log frames over
  * 25 ms with where the time went (update = game logic, render = drawing
@@ -511,6 +512,7 @@ static void kage_sdl_switch_frame_note(void)
             s_boosted = 0;
             isaac_vita_log("isaac-switch: steady frames, CPU boost off");
             isaac_vita_log_set_buffered(1);
+            switch_clock_apply();
         }
     }
     last = now;
@@ -531,6 +533,8 @@ static void kage_sdl_switch_frame_note(void)
         window_frames = 0u;
         s_spikes = 0u;
         isaac_mod_probe_report();
+        if (!s_boosted)
+            switch_clock_apply();
     }
 }
 #endif
