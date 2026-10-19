@@ -12,6 +12,18 @@
 #include "kage_pc_backend.h"
 #include "guest_coverage_generated.h"
 
+#ifndef ISAAC_VITA_AUDIO
+#define ISAAC_VITA_AUDIO 0
+#endif
+
+#if ISAAC_VITA_AUDIO
+#include "host_vita_audio.h"
+#include "host_vita_heap.h"
+#include "host_vita_sync.h"
+
+void isaac_vita_log(const char *format, ...);
+#endif
+
 /* Generated in the full runtime and supplied by a strict test double in the
  * focused PC smoke.  This is the game-owned render-target allocator called by
  * the original InitializeRenderDisplay tail. */
@@ -36,25 +48,34 @@ void sub_00565030(CPU *__restrict c);
  * backend owns that policy, while this global remains the guest-visible
  * current state used by later option changes. */
 #define OPTIONS_VSYNC_OFFSET   0x00000055u
-#define KAGE_VSYNC_STATE       0x307c7b0du
+#define KAGE_VSYNC_STATE       (GUEST_IMAGE_BASE + 0x007c7b0du)
 
 /* Exact KAGE::Sound::Manager singleton and fields used by sub_0056dd70.  Its
  * caller ignores AL, and the original alcOpenDevice(NULL) failure path leaves
  * the manager uninitialised and continues startup. */
-#define KAGE_SOUND_MANAGER_ADDRESS  0x307e7d40u
+#define KAGE_SOUND_MANAGER_ADDRESS  (GUEST_IMAGE_BASE + 0x007e7d40u)
 #define KAGE_SOUND_RUNNING          0x00000004u
 #define KAGE_SOUND_SUSPENDED        0x00000005u
 #define KAGE_SOUND_CONTEXT          0x00000030u
 #define KAGE_SOUND_DEVICE           0x00000034u
+#define KAGE_SOUND_POOL             0x00000008u
+#define KAGE_SOUND_MUTEX_A          0x00000018u
+#define KAGE_SOUND_MUTEX_B          0x00000024u
+#define KAGE_SOUND_THREAD_STATE     0x00000340u
+#define KAGE_SOUND_MUTEX_STORAGE_SIZE 0x0000001cu
+#define KAGE_SOUND_POOL_ALLOCATION_SIZE 0x00000184u
+#define KAGE_SOUND_POOL_COUNT       32u
+#define KAGE_SOUND_FRAME_CALLBACK_GLOBAL (GUEST_IMAGE_BASE + 0x00804114u)
+#define KAGE_SOUND_FRAME_CALLBACK   (GUEST_IMAGE_BASE + 0x0056f8d0u)
 
 /* Exact GetClientRect caches used by the preserved implementations.  The
  * width query publishes RECT.bottom before RECT.right; the height query
  * publishes RECT.right before RECT.bottom.  Several unrelated callers read
  * these four globals directly, so returning EAX alone is not equivalent. */
-#define KAGE_WIDTH_CACHE       0x308071a0u
-#define KAGE_HEIGHT_CACHE      0x308071a4u
-#define KAGE_HEIGHT_COMPANION  0x308071acu
-#define KAGE_WIDTH_COMPANION   0x308071a8u
+#define KAGE_WIDTH_CACHE       (GUEST_IMAGE_BASE + 0x008071a0u)
+#define KAGE_HEIGHT_CACHE      (GUEST_IMAGE_BASE + 0x008071a4u)
+#define KAGE_HEIGHT_COMPANION  (GUEST_IMAGE_BASE + 0x008071acu)
+#define KAGE_WIDTH_COMPANION   (GUEST_IMAGE_BASE + 0x008071a8u)
 
 static int use_original(CPU *__restrict c, guest_fn original)
 {
@@ -345,6 +366,112 @@ int guest_kage_vsync_policy_allows(uint32_t refresh_hz)
     return distance <= 2u;
 }
 
+#if ISAAC_VITA_AUDIO
+/* Native OpenAL through the shared host adapter, mirroring the Vita boundary:
+ * the manager's device/context/names come from host_vita_audio.c, the two
+ * critical sections and the 32-entry pool are built exactly as the original,
+ * and the guest audio thread is replaced by the per-frame update callback. */
+static int sound_mutex_initialize(CPU *__restrict c, uint32_t object)
+{
+    void *storage;
+    uint32_t guest_storage;
+
+    if (ld8(object + 4u) || ld32(object + 8u))
+        return 0;
+    storage = isaac_vita_guest_malloc(KAGE_SOUND_MUTEX_STORAGE_SIZE);
+    if (!storage || isaac_vita_guest_heap_terminal()) {
+        if (storage)
+            (void)isaac_vita_guest_free(storage);
+        return 0;
+    }
+    guest_storage = guest_addr(storage);
+    st8(guest_storage + 0x18u, 0u);
+    if (!isaac_vita_sync_cs_initialize_plain(c, guest_storage)) {
+        (void)isaac_vita_guest_free(storage);
+        return 0;
+    }
+    st32(object + 8u, guest_storage);
+    st8(object + 4u, 1u);
+    return 1;
+}
+
+static void sound_mutex_release(CPU *__restrict c, uint32_t object)
+{
+    uint32_t storage = ld32(object + 8u);
+
+    if (ld8(object + 4u) && storage) {
+        if (!isaac_vita_sync_cs_delete(c, storage))
+            return;
+        (void)isaac_vita_guest_free(guest_ptr(storage));
+    }
+    st32(object + 8u, 0u);
+    st8(object + 4u, 0u);
+}
+
+/* Returns 1 when the call was completed (success, or a fault), 0 to fall back
+ * to the audio-unavailable path. */
+static int sound_initialize_native(CPU *__restrict c)
+{
+    uint32_t manager = c->ecx;
+    uint32_t al_error = 0u;
+    void *pool_block = NULL;
+    uint32_t guest_pool = 0u;
+    int mutex_a = 0;
+    int mutex_b = 0;
+    int status = isaac_vita_audio_manager_initialize(manager, &al_error);
+
+    if (status != ISAAC_VITA_AUDIO_MANAGER_OK) {
+        isaac_vita_log("KAGE PC AUDIO INIT: status=%s al=0x%08x",
+                       isaac_vita_audio_manager_status_name(status),
+                       (unsigned)al_error);
+        if (status == ISAAC_VITA_AUDIO_MANAGER_ALREADY_ACTIVE) {
+            c->eax &= 0xffffff00u;
+            (void)gpop(c);
+            return 1;
+        }
+        return 0;
+    }
+    if (!(mutex_a = sound_mutex_initialize(c, manager + KAGE_SOUND_MUTEX_A)))
+        goto failed;
+    if (!(mutex_b = sound_mutex_initialize(c, manager + KAGE_SOUND_MUTEX_B)))
+        goto failed;
+    pool_block = isaac_vita_guest_calloc(1u, KAGE_SOUND_POOL_ALLOCATION_SIZE);
+    if (!pool_block || isaac_vita_guest_heap_terminal())
+        goto failed;
+    guest_pool = guest_addr(pool_block);
+    st32(guest_pool, KAGE_SOUND_POOL_COUNT);
+    st32(manager + KAGE_SOUND_POOL, guest_pool + 4u);
+    if (ld32(manager + KAGE_SOUND_THREAD_STATE) != 0u)
+        goto failed;
+    st32(KAGE_SOUND_FRAME_CALLBACK_GLOBAL, KAGE_SOUND_FRAME_CALLBACK);
+    st16(manager + KAGE_SOUND_RUNNING, 1u);
+    isaac_vita_log("KAGE PC AUDIO INIT: status=ready device=0x%08x "
+                   "context=0x%08x pump=main-loop guest_thread=off",
+                   (unsigned)ld32(manager + KAGE_SOUND_DEVICE),
+                   (unsigned)ld32(manager + KAGE_SOUND_CONTEXT));
+    c->eax = (c->eax & 0xffffff00u) | 1u;
+    (void)gpop(c);
+    return 1;
+
+failed:
+    if (guest_pool)
+        st32(manager + KAGE_SOUND_POOL, 0u);
+    if (pool_block)
+        (void)isaac_vita_guest_free(pool_block);
+    if (mutex_b)
+        sound_mutex_release(c, manager + KAGE_SOUND_MUTEX_B);
+    if (mutex_a)
+        sound_mutex_release(c, manager + KAGE_SOUND_MUTEX_A);
+    isaac_vita_audio_manager_close(manager);
+    if (isaac_vita_guest_heap_terminal()) {
+        guest_fault(c, manager, "KAGE sound guest heap is terminal");
+        return 1;
+    }
+    isaac_vita_log("KAGE PC AUDIO INIT: status=guest-state-failed");
+    return 0;
+}
+#endif
+
 void sub_0056dd70(CPU *__restrict c)
 {
     guest_coverage_function(GUEST_COVERAGE_MANUAL_KAGE_SOUND_INITIALIZE_ID);
@@ -359,6 +486,10 @@ void sub_0056dd70(CPU *__restrict c)
         return;
     }
 
+#if ISAAC_VITA_AUDIO
+    if (sound_initialize_native(c))
+        return;
+#endif
     /* This is the exact externally visible state of the built-in
      * alcOpenDevice(NULL) failure path, made explicit at the engine seam. */
     st8(c->ecx + KAGE_SOUND_RUNNING, 0u);

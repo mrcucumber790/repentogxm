@@ -88,7 +88,7 @@ NP_RGBA_KERNEL(np_rgba_paeth_blocks, NP_RGBA_PAETH)
 
 #else
 #define ISAAC_NP_RGBA_NEON_AVAILABLE 0
-#if ISAAC_VITA_NATIVE_PNG_RGBA_NEON && defined(__vita__)
+#if ISAAC_VITA_NATIVE_PNG_RGBA_NEON && defined(__vita__) && defined(__arm__)
 #error "Native PNG RGBA NEON requires the target ARM NEON contract"
 #endif
 #endif

@@ -267,10 +267,10 @@ uint64_t guest_atomic_cmpxchg64(uint32_t addr, uint64_t expected,
     /* GCC 10.3 for the Vita emits this inline as LDREXD/STREXD plus DMB; the
      * final softfp ARM link has no libatomic or libgcc helper dependency. */
     return __sync_val_compare_and_swap(
-        (volatile uint64_t *)(uintptr_t)addr, expected, desired);
+        (volatile uint64_t *)guest_ptr(addr), expected, desired);
 #else
     return (uint64_t)InterlockedCompareExchange64(
-        (volatile LONG64 *)(uintptr_t)addr,
+        (volatile LONG64 *)guest_ptr(addr),
         (LONG64)desired, (LONG64)expected);
 #endif
 }
@@ -775,11 +775,11 @@ static int setup_static_tls(uint32_t directory_rva, uint32_t directory_size)
         return 1;
     }
     if (template_size)
-        memcpy(g_tls_block, (void *)(uintptr_t)start, template_size);
+        memcpy(g_tls_block, (void *)guest_ptr(start), template_size);
     g_tls_block_size = total_size;
     g_tls_index = 0U;             /* first slot in our private fake TIB array */
     g_guest_fs_base_cached = 0U;
-    *(uint32_t *)(uintptr_t)index_address = g_tls_index;
+    *(uint32_t *)guest_ptr(index_address) = g_tls_index;
 
     g_tls_callback_count = 0U;
     if (callbacks_address) {
@@ -790,7 +790,7 @@ static int setup_static_tls(uint32_t directory_rva, uint32_t directory_size)
                 fprintf(stderr, "guest: unterminated TLS callback array\n");
                 return 1;
             }
-            callback = *(uint32_t *)(uintptr_t)cell;
+            callback = *(uint32_t *)guest_ptr(cell);
             if (!callback) break;
             if (!guest_image_contains(callback, 1U)) {
                 fprintf(stderr, "guest: TLS callback %08x is outside the image\n",
@@ -866,7 +866,7 @@ void guest_image_free(void)
     if (g_tib && g_tls_index < GUEST_TLS_SLOTS) {
         uint32_t tls_array = *(uint32_t *)(g_tib + 0x2C);
         if (tls_array)
-            *(uint32_t *)(uintptr_t)(tls_array + g_tls_index * 4U) = 0U;
+            *(uint32_t *)guest_ptr(tls_array + g_tls_index * 4U) = 0U;
     }
     if (g_tls_block) free(g_tls_block);
     g_tls_block = NULL;
@@ -1220,10 +1220,10 @@ int guest_stack_init(CPU *c)
     if (!p) {
         return 1;
     }
-    base = (uint32_t)(uintptr_t)p;
+    base = guest_addr(p);
     if (
 #if UINTPTR_MAX > UINT32_MAX
-        (uintptr_t)p > UINT32_MAX ||
+        (uintptr_t)p - GUEST_MEM_BASE > UINT32_MAX ||
 #endif
         GUEST_STACK_SIZE <=
             GUEST_STACK_LOW_MARGIN + GUEST_STACK_TOP_MARGIN ||
@@ -1258,6 +1258,10 @@ int guest_stack_init(CPU *c)
     c->run_scope = NULL;
     c->jump_sites = NULL;
     c->jump_value = 0U;
+#if GUEST_CXX_EH
+    c->eh_sites = NULL;
+    c->eh_handling = NULL;
+#endif
     g_stack_mem = p;
     g_stack_owner = c;
     g_stack_base = c->stack_floor;
@@ -1290,6 +1294,10 @@ void guest_stack_free(CPU *c)
         c->esp = c->ebp = 0;
         c->jump_sites = NULL;
         c->jump_value = 0U;
+#if GUEST_CXX_EH
+        c->eh_sites = NULL;
+        c->eh_handling = NULL;
+#endif
         c->stack_owner = NULL;
         c->stack_floor = 0U;
         c->stack_ceiling = 0U;
@@ -1309,7 +1317,8 @@ static const guest_fn *g_fns;
 static uint32_t        g_count;
 
 #if defined(ISAAC_VITA_GUEST_LOOKUP_CACHE)
-#define GUEST_LOOKUP_CACHE_COUNT 256U
+#define GUEST_LOOKUP_CACHE_BITS 12U
+#define GUEST_LOOKUP_CACHE_COUNT (1U << GUEST_LOOKUP_CACHE_BITS)
 #define GUEST_IMPORT_DENSE_SLOT_COUNT 438U
 
 typedef struct guest_lookup_cache_entry {
@@ -1329,9 +1338,9 @@ static uint32_t g_guest_import_dense_span;
 
 static uint32_t guest_lookup_cache_index(uint32_t key)
 {
-    /* Multiplicative hashing uses the high byte so the low alignment bits of
-     * x86 function RVAs cannot collapse the 256 direct-mapped entries. */
-    return (key * UINT32_C(2654435761)) >> 24;
+    /* Multiplicative hashing uses the high bits so the low alignment bits of
+     * x86 function RVAs cannot collapse the direct-mapped entries. */
+    return (key * UINT32_C(2654435761)) >> (32U - GUEST_LOOKUP_CACHE_BITS);
 }
 
 static void guest_dispatch_cache_invalidate(void)
@@ -2522,6 +2531,12 @@ generic_import_id_dispatch:
         if (guest_host_import(c, imported->name))
             return;
 #endif
+#if GUEST_CXX_EH
+        /* The VCRUNTIME C++ EH rows stay unresolved in the frozen Vita
+         * import-ID map; this build implements them in guest_cxx_eh.c. */
+        if (guest_cxx_eh_import(c, addr, imported->name))
+            return;
+#endif
         guest_fault(c, addr, imported->name);
         return;
     }
@@ -2827,6 +2842,10 @@ GUEST_NORETURN void guest_longjmp(CPU *__restrict c, uint32_t guest_env,
         abort();
     c->jump_value = value ? (uint32_t)value : 1U;
     c->jump_sites = site;       /* records above the target are now stale */
+#if GUEST_CXX_EH
+    /* C++ EH landing sites of the abandoned activations are stale too. */
+    guest_eh_prune(c, site->guest_esp);
+#endif
     longjmp(site->native_env, 1);
 }
 
@@ -2851,7 +2870,7 @@ int guest_tls_process_attach(CPU *__restrict c)
     }
     tls_array = ld32(fs + 0x2CU);
     if (!tls_array || ld32(tls_array + g_tls_index * 4U) !=
-                      (uint32_t)(uintptr_t)g_tls_block) {
+                      guest_addr(g_tls_block)) {
         guest_fault(c, 0U, "static TLS block was not bound into the guest TIB");
         return 1;
     }
@@ -2899,6 +2918,10 @@ int guest_run_until_stop(CPU *__restrict c, guest_fn entry)
      * remains available for diagnostics. */
     c->jump_sites = NULL;
     c->jump_value = 0U;
+#if GUEST_CXX_EH
+    c->eh_sites = NULL;
+    c->eh_handling = NULL;
+#endif
 #if defined(ISAAC_VITA_LUA) && ISAAC_VITA_LUA
     /* guest_fault/guest_exit longjmp over native Lua and translated callback
      * activations.  Drop their process-local ownership before this CPU can be
@@ -2980,7 +3003,7 @@ uint32_t guest_fs_base(CPU *c)
         uint32_t self, tls;
         g_tib = (unsigned char *)calloc(1, 4096);
         if (!g_tib) return 0;
-        self = (uint32_t)(uintptr_t)g_tib;
+        self = guest_addr(g_tib);
         tls = self + 0x100U;        /* zeroed 64-entry TLS pointer array */
         *(uint32_t *)(g_tib + 0x00) = 0xFFFFFFFFu; /* SEH chain head */
         *(uint32_t *)(g_tib + 0x18) = self;        /* NT_TIB.Self */
@@ -2999,11 +3022,11 @@ uint32_t guest_fs_base(CPU *c)
     *(uint32_t *)(g_tib + 0x08) = g_stack_base;
     if (g_tls_block && g_tls_index < GUEST_TLS_SLOTS) {
         uint32_t tls = *(uint32_t *)(g_tib + 0x2C);
-        *(uint32_t *)(uintptr_t)(tls + g_tls_index * 4U) =
-            (uint32_t)(uintptr_t)g_tls_block;
+        *(uint32_t *)guest_ptr(tls + g_tls_index * 4U) =
+            guest_addr(g_tls_block);
     }
     /* Every word written above is now current; generated units compiled with
      * GUEST_FS_BASE_INLINE answer from this until a writer above changes it. */
-    g_guest_fs_base_cached = (uint32_t)(uintptr_t)g_tib;
-    return (uint32_t)(uintptr_t)g_tib;
+    g_guest_fs_base_cached = guest_addr(g_tib);
+    return guest_addr(g_tib);
 }

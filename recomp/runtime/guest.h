@@ -132,6 +132,35 @@ typedef struct guest_jump_site {
     uint32_t guest_registration;
 } guest_jump_site;
 
+/* MSVC x86 C++ exception handling (GUEST_CXX_EH=1, guest_cxx_eh.c).  A catch
+ * resumes at a continuation inside the generated C activation of the
+ * function that owns the catching frame, so that activation registers a
+ * native landing site at its `push __ehhandler$F` prologue instruction
+ * (GUEST_CXX_EH=1 corpora only, recomp/cxx_eh.py).  The record is automatic
+ * storage of the generated body; GUEST_EH_SITE_CLEANUP unlinks it on every C
+ * return, and the runtime prunes records of activations it abandons. */
+#ifndef GUEST_CXX_EH
+#define GUEST_CXX_EH 0
+#endif
+#if GUEST_CXX_EH
+struct CPU;
+typedef struct guest_eh_site {
+    jmp_buf native_env;
+    struct guest_eh_site *previous;
+    struct CPU *cpu;
+    uint32_t registration;  /* guest EH registration node (EBP-0Ch) */
+    uint32_t handler;       /* its __ehhandler$ thunk VA */
+    uint32_t continuation;  /* written by the runtime before longjmp */
+    uint32_t active;
+} guest_eh_site;
+void guest_eh_frame_cleanup(guest_eh_site *site);
+#if defined(__GNUC__) || defined(__clang__)
+#define GUEST_EH_SITE_CLEANUP __attribute__((cleanup(guest_eh_frame_cleanup)))
+#else
+#error "GUEST_CXX_EH needs a compiler with __attribute__((cleanup))"
+#endif
+#endif
+
 /* Which operation last wrote the flags. The consumer needs this to know how
  * to derive CF and OF, which are the only two that are not a pure function
  * of the result. */
@@ -242,6 +271,13 @@ typedef struct CPU {
     guest_jump_site *jump_sites;
     uint32_t         jump_value;
 
+#if GUEST_CXX_EH
+    /* Live C++ EH landing sites (innermost first) and the exceptions whose
+     * catch funclets are running (guest_cxx_eh.c private records). */
+    guest_eh_site   *eh_sites;
+    void            *eh_handling;
+#endif
+
     /* Synthetic-stack ownership is deliberately per CPU.  stack_owner is a
      * host identity token, never a guest pointer: copying a CPU leaves the
      * token pointing at the original and makes the copy fail closed.  Bounds
@@ -309,7 +345,44 @@ typedef struct guest_import {
 /* ------------------------------------------------------------- memory ---- */
 /* Guest address == host address, so these are plain loads and stores. They
  * exist as functions so that a debug build can range-check every access
- * without the translator emitting anything different. */
+ * without the translator emitting anything different.
+ *
+ * GUEST_MEM_WINDOW=1 (64-bit hosts: Switch, x86-64 Linux): a guest address is
+ * an offset into one 4 GiB window reserved by the host runtime, so every
+ * access becomes window base + 32-bit offset.  Generated code is unchanged;
+ * only GUEST_HOST() below differs.  With the default 0 the expansion is the
+ * same identity cast as before, so 32-bit builds produce the same code. */
+#ifndef GUEST_MEM_WINDOW
+#define GUEST_MEM_WINDOW 0
+#endif
+#if GUEST_MEM_WINDOW
+extern uintptr_t g_guest_mem_base;
+#define GUEST_MEM_BASE g_guest_mem_base
+#else
+#define GUEST_MEM_BASE ((uintptr_t)0)
+#endif
+/* Guest address -> host pointer, and back.  GUEST_HOST is the raw mapping the
+ * ld/st helpers use.  Runtime code converts with guest_ptr()/guest_addr(),
+ * which keep NULL <-> 0; guest_addr() is only valid for memory inside the
+ * window (on 32-bit hosts, any pointer) and traps on anything else. */
+#define GUEST_HOST(a) ((void *)(GUEST_MEM_BASE + (uintptr_t)(uint32_t)(a)))
+static inline void *guest_ptr(uint32_t a)
+{
+    return a ? GUEST_HOST(a) : (void *)0;
+}
+static inline uint32_t guest_addr(const void *p)
+{
+#if GUEST_MEM_WINDOW
+    uintptr_t offset = (uintptr_t)p - GUEST_MEM_BASE;
+    if (!p)
+        return 0U;
+    if (offset > (uintptr_t)UINT32_MAX)
+        __builtin_trap(); /* host storage handed to the guest */
+    return (uint32_t)offset;
+#else
+    return (uint32_t)(uintptr_t)p;
+#endif
+}
 
 #ifdef GUEST_CHECKED_MEMORY
 void guest_check(uint32_t addr, uint32_t size, int write);
@@ -324,17 +397,17 @@ void guest_check(uint32_t addr, uint32_t size, int write);
 uint64_t guest_atomic_cmpxchg64(uint32_t addr, uint64_t expected,
                                 uint64_t desired);
 
-static inline uint8_t  ld8 (uint32_t a) { G_CHK(a,1,0); return *(uint8_t  *)(uintptr_t)a; }
-static inline uint16_t ld16(uint32_t a) { G_CHK(a,2,0); return *(uint16_t *)(uintptr_t)a; }
-static inline uint32_t ld32(uint32_t a) { G_CHK(a,4,0); return *(uint32_t *)(uintptr_t)a; }
-static inline uint64_t ld64(uint32_t a) { G_CHK(a,8,0); uint64_t v; memcpy(&v,(void*)(uintptr_t)a,8); return v; }
-static inline xmm_t    ldx (uint32_t a) { G_CHK(a,16,0); xmm_t v; memcpy(&v,(void*)(uintptr_t)a,16); return v; }
+static inline uint8_t  ld8 (uint32_t a) { G_CHK(a,1,0); return *(uint8_t  *)GUEST_HOST(a); }
+static inline uint16_t ld16(uint32_t a) { G_CHK(a,2,0); return *(uint16_t *)GUEST_HOST(a); }
+static inline uint32_t ld32(uint32_t a) { G_CHK(a,4,0); return *(uint32_t *)GUEST_HOST(a); }
+static inline uint64_t ld64(uint32_t a) { G_CHK(a,8,0); uint64_t v; memcpy(&v,GUEST_HOST(a),8); return v; }
+static inline xmm_t    ldx (uint32_t a) { G_CHK(a,16,0); xmm_t v; memcpy(&v,GUEST_HOST(a),16); return v; }
 
-static inline void st8 (uint32_t a, uint8_t  v) { G_CHK(a,1,1); *(uint8_t  *)(uintptr_t)a = v; }
-static inline void st16(uint32_t a, uint16_t v) { G_CHK(a,2,1); *(uint16_t *)(uintptr_t)a = v; }
-static inline void st32(uint32_t a, uint32_t v) { G_CHK(a,4,1); *(uint32_t *)(uintptr_t)a = v; }
-static inline void st64(uint32_t a, uint64_t v) { G_CHK(a,8,1); memcpy((void*)(uintptr_t)a,&v,8); }
-static inline void stx (uint32_t a, xmm_t    v) { G_CHK(a,16,1); memcpy((void*)(uintptr_t)a,&v,16); }
+static inline void st8 (uint32_t a, uint8_t  v) { G_CHK(a,1,1); *(uint8_t  *)GUEST_HOST(a) = v; }
+static inline void st16(uint32_t a, uint16_t v) { G_CHK(a,2,1); *(uint16_t *)GUEST_HOST(a) = v; }
+static inline void st32(uint32_t a, uint32_t v) { G_CHK(a,4,1); *(uint32_t *)GUEST_HOST(a) = v; }
+static inline void st64(uint32_t a, uint64_t v) { G_CHK(a,8,1); memcpy(GUEST_HOST(a),&v,8); }
+static inline void stx (uint32_t a, xmm_t    v) { G_CHK(a,16,1); memcpy(GUEST_HOST(a),&v,16); }
 
 /* Scalar double guest accesses (movsd/addsd/cvtsd2ss memory operands, fld/fstp
  * qword): the memcpy pun.  Measured on the box (arm-vita-eabi-gcc 10.3,
@@ -345,8 +418,8 @@ static inline void stx (uint32_t a, xmm_t    v) { G_CHK(a,16,1); memcpy((void*)(
  * 8-alignment would lie to the compiler about the x86 stack (doubles there
  * are 4-aligned).  Doubles are also rare (3.9k ldd / 1.1k std_ sites vs
  * 115k ldf / 54k stf), so they stay as they are under both knob values. */
-static inline double   ldd (uint32_t a) { G_CHK(a,8,0); double v; memcpy(&v,(void*)(uintptr_t)a,8); return v; }
-static inline void std_(uint32_t a, double   v) { G_CHK(a,8,1); memcpy((void*)(uintptr_t)a,&v,8); }
+static inline double   ldd (uint32_t a) { G_CHK(a,8,0); double v; memcpy(&v,GUEST_HOST(a),8); return v; }
+static inline void std_(uint32_t a, double   v) { G_CHK(a,8,1); memcpy(GUEST_HOST(a),&v,8); }
 
 /* Scalar float guest accesses (movss, the memory operand of addss/mulss/
  * subss/divss/sqrtss/comiss/cvtss2sd/cvttss2si, fld/fstp dword).
@@ -395,25 +468,25 @@ typedef float guest_f32_word __attribute__((may_alias, aligned(4)));
  * same as with the implicit cold section (cmp-verified on guest_0000/0166). */
 static __attribute__((noinline, cold, unused, section(".text.guest_ldf_misaligned")))
 float guest_ldf_misaligned(uint32_t a)
-{ float v; memcpy(&v, (void *)(uintptr_t)a, 4); return v; }
+{ float v; memcpy(&v, GUEST_HOST(a), 4); return v; }
 static __attribute__((noinline, cold, unused, section(".text.guest_stf_misaligned")))
 void guest_stf_misaligned(uint32_t a, float v)
-{ memcpy((void *)(uintptr_t)a, &v, 4); }
+{ memcpy(GUEST_HOST(a), &v, 4); }
 static inline float ldf(uint32_t a)
 {
     G_CHK(a,4,0);
     if (GUEST_F32_MISALIGNED(a)) return guest_ldf_misaligned(a);
-    return *(const guest_f32_word *)(uintptr_t)a;
+    return *(const guest_f32_word *)GUEST_HOST(a);
 }
 static inline void stf(uint32_t a, float v)
 {
     G_CHK(a,4,1);
     if (GUEST_F32_MISALIGNED(a)) { guest_stf_misaligned(a, v); return; }
-    *(guest_f32_word *)(uintptr_t)a = v;
+    *(guest_f32_word *)GUEST_HOST(a) = v;
 }
 #else
-static inline float    ldf (uint32_t a) { G_CHK(a,4,0); float  v; memcpy(&v,(void*)(uintptr_t)a,4); return v; }
-static inline void stf (uint32_t a, float    v) { G_CHK(a,4,1); memcpy((void*)(uintptr_t)a,&v,4); }
+static inline float    ldf (uint32_t a) { G_CHK(a,4,0); float  v; memcpy(&v,GUEST_HOST(a),4); return v; }
+static inline void stf (uint32_t a, float    v) { G_CHK(a,4,1); memcpy(GUEST_HOST(a),&v,4); }
 #endif
 
 /* ------------------------------------------------ SSE lowering tokens ---- */
@@ -463,12 +536,12 @@ typedef guest_v_u32 guest_v_u32_unaligned __attribute__((aligned(1), may_alias))
 static inline __attribute__((always_inline)) guest_v_u32 guest_ldxv(uint32_t a)
 {
     G_CHK(a, 16, 0);
-    return *(const guest_v_u32_unaligned *)(uintptr_t)a;
+    return *(const guest_v_u32_unaligned *)GUEST_HOST(a);
 }
 static inline __attribute__((always_inline)) void guest_stxv(uint32_t a, guest_v_u32 v)
 {
     G_CHK(a, 16, 1);
-    *(guest_v_u32_unaligned *)(uintptr_t)a = v;
+    *(guest_v_u32_unaligned *)GUEST_HOST(a) = v;
 }
 #define GUEST_XMM_LAUNDER(d) __asm__("" : "+m"(c->x[d].v_u32))
 #define GUEST_XMM_MOV(d, s) \
@@ -767,7 +840,7 @@ static inline void st80d(uint32_t a, double v)
     out[8] = (uint8_t)sign_exponent;
     out[9] = (uint8_t)(sign_exponent >> 8);
     G_CHK(a, 10, 1);
-    memcpy((void *)(uintptr_t)a, out, sizeof out);
+    memcpy(GUEST_HOST(a), out, sizeof out);
 }
 
 /* -------------------------------------------------------------- stack ---- */
@@ -1627,6 +1700,20 @@ void guest_setjmp_leave(CPU *__restrict c, guest_jump_site *site);
 #endif
 GUEST_NORETURN void guest_longjmp(CPU *__restrict c, uint32_t guest_env,
                                   int32_t value);
+
+#if GUEST_CXX_EH
+/* Generated at an owner's `push __ehhandler$F`: RN is the next push slot. */
+void guest_eh_frame_enter(CPU *__restrict c, guest_eh_site *site,
+                          uint32_t handler);
+/* A native nonlocal transfer (guest longjmp, a Lua error escape) that leaves
+ * the guest stack at `guest_esp` abandoned every generated activation whose
+ * EH frame lies below it: drop their landing sites and pending catches before
+ * any new site can be linked over the dead native frames. */
+void guest_eh_prune(CPU *__restrict c, uint32_t guest_esp);
+/* Unresolved-import hook: the VCRUNTIME C++ EH entry points.  Returns 1 when
+ * handled (or never returns), 0 for any other import. */
+int guest_cxx_eh_import(CPU *__restrict c, uint32_t addr, const char *name);
+#endif
 
 enum {
     GUEST_RUN_INVALID  = -1,

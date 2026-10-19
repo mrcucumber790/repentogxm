@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "host_vita_native_png.h"
@@ -563,7 +564,14 @@ typedef struct np_session {
 } np_session;
 
 static np_session s_ses;
+#if GUEST_MEM_WINDOW
+/* The guest stream reads into the staging buffer, so on a 64-bit host it must
+ * live inside the guest window (the process heap is the window heap); a
+ * static array would not be guest-addressable. */
+static uint8_t *s_staging;
+#else
 static uint8_t s_staging[ISAAC_NP_STAGING_BYTES] __attribute__((aligned(16)));
+#endif
 static uint32_t s_tinfl_state[ISAAC_NP_TINFL_STATE_BYTES / 4U];
 static uint8_t s_last_row[ISAAC_NP_MAX_DIMENSION * 4U];
 static int s_init_logged;
@@ -1043,7 +1051,32 @@ static uint32_t np_guest_read(void *ctx, uint8_t *dst, uint32_t n)
     uint32_t got;
     int ok;
 
-    args[0] = (uint32_t)(uintptr_t)dst;
+#if GUEST_MEM_WINDOW
+    /* The decoder also reads small headers into host stack buffers, which a
+     * 64-bit host cannot hand to the guest: bounce those through a buffer in
+     * the guest window. */
+    if ((uintptr_t)dst - GUEST_MEM_BASE > (uintptr_t)UINT32_MAX - n) {
+        static uint8_t *bounce;
+        if (n > ISAAC_NP_STAGING_BYTES)
+            return 0U;
+        if (!bounce)
+            bounce = (uint8_t *)aligned_alloc(16U, ISAAC_NP_STAGING_BYTES);
+        if (!bounce)
+            return 0U;
+        args[0] = guest_addr(bounce);
+        args[1] = 1U;
+        args[2] = n;
+        got = np_guest_vcall(io->c, io->stream, ISAAC_NP_STREAM_VT_READ, args,
+                             3U, &ok);
+        if (!ok)
+            return 0U;
+        if (got > n)
+            got = n;
+        memcpy(dst, bounce, got);
+        return got;
+    }
+#endif
+    args[0] = guest_addr(dst);
     args[1] = 1U;
     args[2] = n;
     got = np_guest_vcall(io->c, io->stream, ISAAC_NP_STREAM_VT_READ, args, 3U,
@@ -1230,11 +1263,11 @@ static void np_write_final_state(const np_session *s)
     st32(png + ISAAC_NP_PNG_ROW_NUMBER, s->height);
     if (row_buf) {
         st8(row_buf, (uint8_t)s->last_filter);
-        memcpy((void *)(uintptr_t)(row_buf + 1U), last + 1, s->rowbytes);
+        memcpy(guest_ptr(row_buf + 1U), last + 1, s->rowbytes);
     }
     if (prev_row) {
         st8(prev_row, (uint8_t)s->last_filter);
-        memcpy((void *)(uintptr_t)(prev_row + 1U), s_last_row, s->rowbytes);
+        memcpy(guest_ptr(prev_row + 1U), s_last_row, s->rowbytes);
     }
 }
 
@@ -1282,7 +1315,7 @@ static void np_serve_row(CPU *__restrict c, np_session *s, uint32_t row)
     if (k == 0U)
         np_write_row_info(s);
     if (row)
-        memcpy((void *)(uintptr_t)row, src, s->rowbytes);
+        memcpy(guest_ptr(row), src, s->rowbytes);
     st32(s->png + ISAAC_NP_PNG_ROW_NUMBER, k + 1U);
     s->next_row = k + 1U;
     (void)gpop(c);
@@ -1330,7 +1363,7 @@ int isaac_vita_native_png_middle_rows_try(CPU *__restrict c)
         ld32(s->png + ISAAC_NP_PNG_ROW_NUMBER) != 1u)
         goto done;
     token = isaac_vita_guest_heap_lease_exact_range(
-        (const void *)(uintptr_t)c->esi, (const void *)(uintptr_t)c->esi,
+        guest_ptr(c->esi), guest_ptr(c->esi),
         (size_t)s->height * 4u);
     if (!token)
         goto done;
@@ -1400,11 +1433,11 @@ static void np_verify_finish(CPU *__restrict c, np_session *s)
     if (ld32(png + ISAAC_NP_PNG_Z_AVAIL_IN) != 0U) s->v_state_bad |= 32U;
     if (ld32(png + ISAAC_NP_PNG_Z_AVAIL_OUT) != 0U) s->v_state_bad |= 64U;
     if (row_buf && (ld8(row_buf) != s->last_filter ||
-                    memcmp((const void *)(uintptr_t)(row_buf + 1U), last + 1,
+                    memcmp(guest_ptr(row_buf + 1U), last + 1,
                            s->rowbytes) != 0))
         s->v_rowbuf_bad |= 1U;
     if (prev_row && (ld8(prev_row) != s->last_filter ||
-                     memcmp((const void *)(uintptr_t)(prev_row + 1U),
+                     memcmp(guest_ptr(prev_row + 1U),
                             s_last_row, s->rowbytes) != 0))
         s->v_rowbuf_bad |= 2U;
     if (!np_guest_tell(c, s->stream, &pos) || pos != s->end_pos)
@@ -1453,7 +1486,7 @@ static void np_verify_row(CPU *__restrict c, np_session *s, uint32_t row,
     np_call_real(c, eax0, s->png, row);
     s->translated_us += (uint32_t)(np_now_us() - t0);
     if (row) {
-        const uint8_t *dst = (const uint8_t *)(uintptr_t)row;
+        const uint8_t *dst = (const uint8_t *)guest_ptr(row);
         if (memcmp(dst, src, s->rowbytes) != 0) {
             uint32_t i;
             uint32_t diff = 0U;
@@ -1596,6 +1629,14 @@ static void np_start(CPU *__restrict c, uint32_t png, uint32_t row,
         np_begin_translated(c, png, row, eax0, "stream-seek");
         return;
     }
+#if GUEST_MEM_WINDOW
+    if (!s_staging)
+        s_staging = (uint8_t *)aligned_alloc(16U, ISAAC_NP_STAGING_BYTES);
+    if (!s_staging) {
+        np_begin_translated(c, png, row, eax0, "memory");
+        return;
+    }
+#endif
     raw = np_scratch_acquire(s->height * (s->rowbytes + 1U));
     if (!raw) {
         np_begin_translated(c, png, row, eax0, "memory");
@@ -1609,7 +1650,7 @@ static void np_start(CPU *__restrict c, uint32_t png, uint32_t row,
     params.first_remaining = ld32(png + ISAAC_NP_PNG_IDAT_SIZE);
     params.crc_entry = ld32(png + ISAAC_NP_PNG_CRC);
     params.gamma_table = s->gamma
-        ? (const uint8_t *)(uintptr_t)ld32(png + ISAAC_NP_PNG_GAMMA_TABLE)
+        ? (const uint8_t *)guest_ptr(ld32(png + ISAAC_NP_PNG_GAMMA_TABLE))
         : NULL;
     work.raw = raw;
     work.staging = s_staging;

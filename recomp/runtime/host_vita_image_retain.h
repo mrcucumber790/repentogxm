@@ -174,7 +174,11 @@
 #define ISAAC_IR_BUCKET_STRIDE        12U
 #define ISAAC_IR_MAX_SCAN_ENTRIES     4096U /* manager-scan ceiling (device: ~1,200 live) */
 #define ISAAC_IR_BYTES_CAP           (16U * 1024U * 1024U) /* 2048x2048 RGBA */
+#if defined(__SWITCH__)
+#define ISAAC_IR_REPORT_EVERY         4096U /* log on SD: keep it rare */
+#else
 #define ISAAC_IR_REPORT_EVERY         64U   /* periodic receipt cadence, in offers */
+#endif
 #define ISAAC_IR_HEADROOM_EVICT_MAX   8U    /* LRU tails released per candidate under headroom pressure */
 
 /* Per-run counters (the receipt / ph120.ir fields). */

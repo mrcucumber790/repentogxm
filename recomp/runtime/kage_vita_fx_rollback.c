@@ -29,7 +29,7 @@
     !defined(KAGE_VITA_FX_ROLLBACK_READ32)
 static uint32_t kage_vita_fx_read32(uint32_t address)
 {
-    return *(const uint32_t *)(uintptr_t)address;
+    return *(const uint32_t *)guest_ptr(address);
 }
 #define KAGE_VITA_FX_ROLLBACK_READ32(address) \
     kage_vita_fx_read32((address))
@@ -38,7 +38,7 @@ static uint32_t kage_vita_fx_read32(uint32_t address)
 #ifndef KAGE_VITA_FX_ROLLBACK_HEAP_LEASE
 #define KAGE_VITA_FX_ROLLBACK_HEAP_LEASE(address, size, base_out) \
     isaac_vita_guest_heap_lease_containing( \
-        (const void *)(uintptr_t)(address), (size), (base_out))
+        (const void *)guest_ptr(address), (size), (base_out))
 #endif
 
 #ifndef KAGE_VITA_FX_ROLLBACK_HEAP_RELEASE

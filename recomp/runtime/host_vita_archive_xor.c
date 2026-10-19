@@ -52,13 +52,13 @@ static int xor_release(uint32_t tokens[XOR_LEASES])
 static uint32_t xor_refresh_load(uint32_t address)
 {
     uint32_t value;
-    memcpy(&value, (const void *)(uintptr_t)address, sizeof value);
+    memcpy(&value, guest_ptr(address), sizeof value);
     return value;
 }
 
 static void xor_refresh_store(uint32_t address, uint32_t value)
 {
-    memcpy((void *)(uintptr_t)address, &value, sizeof value);
+    memcpy(guest_ptr(address), &value, sizeof value);
 }
 
 /* Called ONLY with the existing archive object's three leases held and its
@@ -134,6 +134,22 @@ int isaac_vita_archive_xor_refresh_oracle(CPU *__restrict c)
 #endif
 #endif
 
+/* An archive object constructed in a caller's frame cannot be freed under
+ * us: with ISAAC_VITA_ARCHIVE_STACK_OBJECTS (64-bit hosts) accept one that
+ * lies wholly inside the live guest stack above the two stacked arguments,
+ * in place of a heap lease. */
+static int xor_stack_object(const CPU *__restrict c, uint32_t object)
+{
+#if defined(ISAAC_VITA_ARCHIVE_STACK_OBJECTS)
+    return object >= c->esp + 12U && object < c->stack_ceiling &&
+           XOR_OBJECT_BYTES <= c->stack_ceiling - object;
+#else
+    (void)c;
+    (void)object;
+    return 0;
+#endif
+}
+
 /* 0: no guest mutation, replay the original. 1: completed or terminal fault. */
 int isaac_vita_archive_xor_try(CPU *__restrict c)
 {
@@ -159,21 +175,24 @@ int isaac_vita_archive_xor_try(CPU *__restrict c)
         output != object + XOR_OUTPUT_OFFSET || output != c->ebx ||
         !decoder || decoder > UINT32_MAX - XOR_DECODER_BYTES ||
         xor_overlap(object, XOR_OBJECT_BYTES, decoder, XOR_DECODER_BYTES) ||
-        xor_overlap(object, XOR_OBJECT_BYTES, c->stack_floor,
-                    c->stack_ceiling - c->stack_floor) ||
+        (xor_overlap(object, XOR_OBJECT_BYTES, c->stack_floor,
+                     c->stack_ceiling - c->stack_floor) &&
+         !xor_stack_object(c, object)) ||
         xor_overlap(decoder, XOR_DECODER_BYTES, c->stack_floor,
                     c->stack_ceiling - c->stack_floor))
         return 0;
 
-    tokens[0] = isaac_vita_guest_heap_lease_exact_range(
-        (const void *)(uintptr_t)object, (const void *)(uintptr_t)object,
-        XOR_OBJECT_BYTES);
-    if (!tokens[0])
-        return 0;
+    if (!xor_stack_object(c, object)) {
+        tokens[0] = isaac_vita_guest_heap_lease_exact_range(
+            guest_ptr(object), guest_ptr(object),
+            XOR_OBJECT_BYTES);
+        if (!tokens[0])
+            return 0;
+    }
     if (ld32(object + 0x14U) != decoder)
         goto reject;
     tokens[1] = isaac_vita_guest_heap_lease_exact_range(
-        (const void *)(uintptr_t)decoder, (const void *)(uintptr_t)decoder,
+        guest_ptr(decoder), guest_ptr(decoder),
         XOR_DECODER_BYTES);
     if (!tokens[1])
         goto reject;
@@ -186,7 +205,7 @@ int isaac_vita_archive_xor_try(CPU *__restrict c)
                     c->stack_ceiling - c->stack_floor))
         goto reject;
     tokens[2] = isaac_vita_guest_heap_lease_exact_range(
-        (const void *)(uintptr_t)state, (const void *)(uintptr_t)state,
+        guest_ptr(state), guest_ptr(state),
         XOR_STATE_BYTES);
     if (!tokens[2])
         goto reject;
@@ -242,12 +261,12 @@ int isaac_vita_archive_xor_try(CPU *__restrict c)
             st32(state, index);
         }
         if (bytes == 4U) {
-            memcpy(&value, (const void *)(uintptr_t)(output + offset),
+            memcpy(&value, guest_ptr(output + offset),
                    sizeof value);
             last_before = value >> 24;
             last_key = key >> 24;
             value ^= key;
-            memcpy((void *)(uintptr_t)(output + offset), &value, sizeof value);
+            memcpy(guest_ptr(output + offset), &value, sizeof value);
         } else {
             uint32_t byte;
             for (byte = 0U; byte < bytes; ++byte) {

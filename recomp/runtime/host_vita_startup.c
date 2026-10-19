@@ -285,6 +285,24 @@ static void vita_startup_GetSystemInfo(CPU *__restrict c)
     vita_startup_stdcall_return(c, 4U);
 }
 
+/* GLFW's Windows joystick backend probes XInput, then DirectInput 8, when a
+ * platform keeps GLFW initialised (the PC KAGE boundary).  Absent modules
+ * select GLFW's no-joystick path; the host backend supplies input itself. */
+static int vita_startup_optional_input_module(const char *module)
+{
+    static const char *const modules[] = {
+        "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll",
+        "xinput1_2.dll", "xinput1_1.dll", "bin\\xinput1_3.dll",
+        "dinput8.dll"
+    };
+    size_t i;
+
+    for (i = 0U; i < sizeof modules / sizeof modules[0]; ++i)
+        if (vita_startup_module_equal(module, modules[i]))
+            return 1;
+    return 0;
+}
+
 static void vita_startup_LoadLibraryA(CPU *__restrict c)
 {
     uint32_t name = vita_startup_arg(c, 0U);
@@ -301,7 +319,9 @@ static void vita_startup_LoadLibraryA(CPU *__restrict c)
         !vita_startup_module_equal(
             module, ISAAC_VITA_STARTUP_LOAD_USERENV_MODULE) &&
         !vita_startup_module_equal(
-            module, ISAAC_VITA_STARTUP_LOAD_WINMM_MODULE)) {
+            module, ISAAC_VITA_STARTUP_LOAD_WINMM_MODULE) &&
+        !vita_startup_optional_input_module(module)) {
+        isaac_vita_log("LoadLibraryA: unexpected module %s", module);
         guest_fault(c, name, "LoadLibraryA received an unexpected module");
         return;
     }
@@ -376,6 +396,10 @@ static void vita_startup_FreeLibrary(CPU *__restrict c)
     vita_startup_stdcall_return(c, 4U);
 }
 
+#if defined(GUEST_MEM_WINDOW)
+int isaac_mod_probe_known_missing(const char *path);
+#endif
+
 static void vita_startup_GetFileAttributesA(CPU *__restrict c)
 {
     uint32_t path = vita_startup_arg(c, 0U);
@@ -388,6 +412,24 @@ static void vita_startup_GetFileAttributesA(CPU *__restrict c)
 #if defined(ISAAC_VITA_ASYNC_SAVE_WRITE)
     /* Attribute probes must observe a save whose image is still queued. */
     isaac_vita_async_write_sync_path(native_path);
+#endif
+#if defined(GUEST_MEM_WINDOW)
+    /* Mod override probes for assets the mod does not have: answered from
+     * directory listings (linux64/mod_probe_cache.c). */
+    switch (isaac_mod_probe_known_missing(native_path)) {
+    case 0:
+        break;
+    case 1:
+        vita_startup_set_last_error(c, ISAAC_VITA_STARTUP_ERROR_FILE_NOT_FOUND);
+        c->eax = ISAAC_VITA_STARTUP_INVALID_FILE_ATTRIBUTES;
+        vita_startup_stdcall_return(c, 4U);
+        return;
+    default:
+        vita_startup_set_last_error(c, ISAAC_VITA_STARTUP_ERROR_PATH_NOT_FOUND);
+        c->eax = ISAAC_VITA_STARTUP_INVALID_FILE_ATTRIBUTES;
+        vita_startup_stdcall_return(c, 4U);
+        return;
+    }
 #endif
     if (stat(native_path, &information) != 0) {
         int native_error = errno;
@@ -478,7 +520,7 @@ static void vita_startup_GetCurrentDirectoryA(CPU *__restrict c)
             c, output, length + 1U,
             "GetCurrentDirectoryA received an invalid output range"))
         return;
-    memcpy((void *)(uintptr_t)output, ISAAC_VITA_DATA_ROOT, length + 1U);
+    memcpy((void *)guest_ptr(output), ISAAC_VITA_DATA_ROOT, length + 1U);
     c->eax = length;
     vita_startup_stdcall_return(c, 8U);
 }

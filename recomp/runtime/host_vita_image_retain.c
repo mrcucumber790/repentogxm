@@ -16,7 +16,7 @@
 #error The image-retain seam must only be compiled for its opt-in feature
 #endif
 
-#if !defined(ISAAC_VITA_IMAGE_RETAIN_ORACLE)
+#if !defined(ISAAC_VITA_IMAGE_RETAIN_ORACLE) && !GUEST_MEM_WINDOW
 #include <vitaGL.h>
 #endif
 
@@ -84,6 +84,12 @@ static struct {
 #if defined(ISAAC_VITA_IMAGE_RETAIN_ORACLE)
 static uint32_t ir_free_ram(void)  { return isaac_ir_oracle_free_ram(); }
 static uint32_t ir_free_vram(void) { return isaac_ir_oracle_free_vram(); }
+#elif GUEST_MEM_WINDOW
+/* 64-bit hosts (desktop GL, Switch): textures live in the GL driver's own
+ * memory, not a fixed vitaGL pool, so there is no free-memory figure to
+ * keep headroom against; the byte budget alone bounds the retained set. */
+static uint32_t ir_free_ram(void)  { return UINT32_MAX; }
+static uint32_t ir_free_vram(void) { return 0U; }
 #else
 static uint32_t ir_free_ram(void)  { return (uint32_t)vglMemFree(VGL_MEM_RAM); }
 static uint32_t ir_free_vram(void) { return (uint32_t)vglMemFree(VGL_MEM_VRAM); }
@@ -943,6 +949,18 @@ static void ir_wrap(CPU *__restrict c, void (*real)(CPU *__restrict))
 #if defined(ISAAC_VITA_IMAGE_RETAIN_WRAP)
 void __wrap_sub_0056d8c0(CPU *__restrict c)
 {
+#if defined(ISAAC_VITA_IMAGE_RETAIN_LAZY_ARM)
+    /* Hosts without the Vita loading screen owner (kage_vita_loading.c) arm
+     * here, on the first observer call once the ImageManager and its lock
+     * are constructed; a failed attempt is retried every 4096 calls, a few
+     * times at most. */
+    static uint32_t lazy_calls;
+    static uint32_t lazy_attempts;
+    if (!s_ir.armed && lazy_attempts < 8U && (lazy_calls++ & 4095U) == 0U) {
+        ++lazy_attempts;
+        isaac_vita_image_retain_arm();
+    }
+#endif
     ir_wrap(c, __real_sub_0056d8c0);
 }
 #endif

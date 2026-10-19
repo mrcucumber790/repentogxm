@@ -78,13 +78,17 @@
 #define ISAAC_VITA_LUA_SCOPE_FASTPATH 1
 #endif
 
-_Static_assert(sizeof(void *) == 4U,
+/* 64-bit window hosts translate every pointer and out-parameter at this
+ * boundary (guest_ptr/guest_addr, VITA_LUA_SIZE_OUT, VITA_LUA_DEBUG_IN). */
+_Static_assert(sizeof(void *) == 4U || GUEST_MEM_WINDOW,
                "the frozen Lua ABI requires a 32-bit native target");
 _Static_assert(sizeof(lua_Integer) == 8U,
                "Lua 5.3.3 lua_Integer ABI drifted");
 _Static_assert(sizeof(lua_Number) == 8U,
                "Lua 5.3.3 lua_Number ABI drifted");
-_Static_assert(sizeof(lua_KContext) == 4U,
+/* Only zero continuations are accepted (callk/pcallk), so a wider native
+ * lua_KContext never carries guest data. */
+_Static_assert(sizeof(lua_KContext) == 4U || GUEST_MEM_WINDOW,
                "the frozen x86 lua_KContext ABI requires 32 bits");
 
 typedef void (*vita_lua_handler)(CPU *__restrict c);
@@ -141,6 +145,12 @@ typedef struct vita_lua_callback_frame {
 #if defined(ISAAC_VITA_GUEST_SAMPLER)
     /* g_kage_guest_last_indirect_target when this callback was entered. */
     uint32_t sampler_enclosing_target;
+#endif
+#if GUEST_CXX_EH
+    /* Guest fs:[0] at entry.  A Lua error escape abandons the callback's
+     * guest frames without their epilogues; like MSVC longjmp, put the
+     * registration chain back so no dead EH frame stays linked. */
+    uint32_t saved_fs0;
 #endif
 } vita_lua_callback_frame;
 
@@ -284,7 +294,7 @@ static double vita_lua_arg_number(CPU *__restrict c, uint32_t index)
 
 static lua_State *vita_lua_arg_state(CPU *__restrict c)
 {
-    return (lua_State *)(uintptr_t)vita_lua_arg(c, 0U);
+    return (lua_State *)guest_ptr(vita_lua_arg(c, 0U));
 }
 
 static void vita_lua_return(CPU *__restrict c)
@@ -294,7 +304,7 @@ static void vita_lua_return(CPU *__restrict c)
 
 static void vita_lua_return_pointer(CPU *__restrict c, const void *pointer)
 {
-    c->eax = (uint32_t)(uintptr_t)pointer;
+    c->eax = guest_addr(pointer);
     vita_lua_return(c);
 }
 
@@ -368,6 +378,9 @@ static void vita_lua_restore_callback_cpu(vita_lua_callback_frame *frame)
 {
     CPU *c = frame->cpu;
     (void)guest_stack_set(c, frame->saved_esp, 0U);
+#if GUEST_CXX_EH
+    st32(guest_fs_base(c), frame->saved_fs0);
+#endif
     c->ebx = frame->saved_ebx;
     c->ebp = frame->saved_ebp;
     c->esi = frame->saved_esi;
@@ -411,6 +424,9 @@ static int vita_lua_callback_frame_push(CPU *c, lua_State *state)
             frame->saved_ebp = c->ebp;
             frame->saved_esi = c->esi;
             frame->saved_edi = c->edi;
+#if GUEST_CXX_EH
+            frame->saved_fs0 = ld32(guest_fs_base(c));
+#endif
             frame->previous = s_vita_lua_callback_top;
             s_vita_lua_callback_top = (int)i;
             return (int)i;
@@ -458,8 +474,29 @@ static int vita_lua_recover_callbacks(CPU *c, int entry_mark)
         recovered = 1;
     }
     (void)recovered;
+#if GUEST_CXX_EH
+    /* Every guest activation below the restored (or unchanged import) ESP
+     * was abandoned by Lua's longjmp: drop its C++ EH landing sites. */
+    guest_eh_prune(c, c->esp);
+#endif
     return 1;
 }
+
+#if GUEST_CXX_EH
+/* guest_cxx_eh.c: a guest catch must not resume above the innermost native
+ * callback trampoline of this CPU (native Lua frames lie between). */
+uint32_t isaac_vita_lua_callback_boundary_esp(CPU *c)
+{
+    int slot = s_vita_lua_callback_top;
+    const vita_lua_callback_frame *frame;
+    if (slot < 0 || (uint32_t)slot >= VITA_LUA_MAX_CALLBACK_DEPTH)
+        return 0U;
+    frame = &s_vita_lua_callbacks[slot];
+    if (!frame->used || frame->cpu != c)
+        return 0U;
+    return frame->saved_esp;
+}
+#endif
 
 static void vita_lua_copy_error_text(char output[VITA_LUA_ERROR_TEXT_MAX + 1U],
                                      uint32_t guest_text)
@@ -794,7 +831,7 @@ static unsigned vita_lua_beat_sample_stack(const CPU *c, uint32_t *out,
         uint32_t value;
         if (address > ceiling - 4U)
             break;
-        value = *(volatile const uint32_t *)(uintptr_t)address;
+        value = *(volatile const uint32_t *)guest_ptr(address);
         if (value - (uint32_t)GUEST_IMAGE_BASE < VITA_LUA_BEAT_TEXT_END_RVA)
             out[found++] = value - (uint32_t)GUEST_IMAGE_BASE;
     }
@@ -953,7 +990,7 @@ static int vita_lua_call_guest(lua_State *state, uint32_t target)
 #endif
 
     if (setjmp(frame->escape) == 0) {
-        gpush(c, (uint32_t)(uintptr_t)state);
+        gpush(c, guest_addr(state));
         gpush(c, VITA_LUA_CALLBACK_RETURN);
         guest_call(c, target);
         if (c->fault) {
@@ -989,6 +1026,11 @@ static int vita_lua_call_guest(lua_State *state, uint32_t target)
         }
 #endif
     }
+#if GUEST_CXX_EH
+    /* After an escape longjmp the activations below the callback boundary
+     * are gone; on a normal return this finds nothing to drop. */
+    guest_eh_prune(c, c->esp);
+#endif
 #if defined(ISAAC_VITA_DEEP_PROFILE)
     kage_vita_deep_unwind(deep_callback_mark);
 #endif
@@ -1400,7 +1442,7 @@ static void *vita_lua_guest_allocator(void *opaque, void *pointer,
 
     if (!allocator || !allocator->used ||
         old_size > UINT32_MAX || new_size > UINT32_MAX ||
-        (uintptr_t)pointer > UINT32_MAX)
+        (pointer && (uintptr_t)pointer - GUEST_MEM_BASE > UINT32_MAX))
         return NULL;
     c = allocator->cpu;
     if (!c || vita_lua_active_load() != (uintptr_t)c)
@@ -1408,7 +1450,7 @@ static void *vita_lua_guest_allocator(void *opaque, void *pointer,
     saved_esp = c->esp;
     gpush(c, (uint32_t)new_size);
     gpush(c, (uint32_t)old_size);
-    gpush(c, (uint32_t)(uintptr_t)pointer);
+    gpush(c, guest_addr(pointer));
     gpush(c, allocator->guest_ud);
     gpush(c, VITA_LUA_CALLBACK_RETURN);
     guest_call(c, allocator->target);
@@ -1419,7 +1461,7 @@ static void *vita_lua_guest_allocator(void *opaque, void *pointer,
     result = c->eax;
     if (!guest_stack_adjust(c, 16U, allocator->target))
         return NULL;
-    return (void *)(uintptr_t)result;
+    return (void *)guest_ptr(result);
 }
 
 /* luaL_newstate's stock lauxlib allocator calls the process realloc/free
@@ -1564,7 +1606,7 @@ static void vita_lua_getfield_import(CPU *__restrict c)
     VITA_LUA_BEGIN();
     c->eax = (uint32_t)lua_getfield(
         state, vita_lua_index((int32_t)vita_lua_arg(c, 1U)),
-        (const char *)(uintptr_t)vita_lua_arg(c, 2U));
+        (const char *)guest_ptr(vita_lua_arg(c, 2U)));
     VITA_LUA_END();
 }
 
@@ -1633,13 +1675,99 @@ static void vita_lua_openlibs_import(CPU *__restrict c)
     VITA_LUA_END();
 }
 
+/* Guest out-parameters whose layout differs on 64-bit hosts: size_t lengths
+ * (4 bytes in the guest) and lua_Debug (32-bit pointer fields).  On 32-bit
+ * hosts both are passed through unchanged.  Each import uses one at a time,
+ * on the thread that owns the Lua scope. */
+#if GUEST_MEM_WINDOW
+static size_t s_vita_lua_size_out;
+static lua_Debug s_vita_lua_debug;
+
+static size_t *vita_lua_size_out(uint32_t guest)
+{
+    s_vita_lua_size_out = 0U;
+    return guest ? &s_vita_lua_size_out : NULL;
+}
+
+static void vita_lua_size_store(uint32_t guest)
+{
+    if (guest)
+        st32(guest, (uint32_t)s_vita_lua_size_out);
+}
+
+enum {
+    VITA_LUA_GUEST_DEBUG_EVENT = 0U,
+    VITA_LUA_GUEST_DEBUG_NAME = 4U,
+    VITA_LUA_GUEST_DEBUG_NAMEWHAT = 8U,
+    VITA_LUA_GUEST_DEBUG_WHAT = 12U,
+    VITA_LUA_GUEST_DEBUG_SOURCE = 16U,
+    VITA_LUA_GUEST_DEBUG_CURRENTLINE = 20U,
+    VITA_LUA_GUEST_DEBUG_LINEDEFINED = 24U,
+    VITA_LUA_GUEST_DEBUG_LASTLINEDEFINED = 28U,
+    VITA_LUA_GUEST_DEBUG_NUPS = 32U,
+    VITA_LUA_GUEST_DEBUG_NPARAMS = 33U,
+    VITA_LUA_GUEST_DEBUG_ISVARARG = 34U,
+    VITA_LUA_GUEST_DEBUG_ISTAILCALL = 35U,
+    VITA_LUA_GUEST_DEBUG_SHORT_SRC = 36U,
+    VITA_LUA_GUEST_DEBUG_I_CI = 36U + LUA_IDSIZE
+};
+
+static lua_Debug *vita_lua_debug_in(uint32_t guest)
+{
+    memset(&s_vita_lua_debug, 0, sizeof s_vita_lua_debug);
+    if (!guest)
+        return &s_vita_lua_debug;
+    s_vita_lua_debug.event = (int)ld32(guest + VITA_LUA_GUEST_DEBUG_EVENT);
+    s_vita_lua_debug.i_ci = (struct CallInfo *)guest_ptr(
+        ld32(guest + VITA_LUA_GUEST_DEBUG_I_CI));
+    return &s_vita_lua_debug;
+}
+
+static void vita_lua_debug_out(uint32_t guest)
+{
+    const lua_Debug *d = &s_vita_lua_debug;
+    uint32_t i;
+
+    if (!guest)
+        return;
+    st32(guest + VITA_LUA_GUEST_DEBUG_EVENT, (uint32_t)d->event);
+    st32(guest + VITA_LUA_GUEST_DEBUG_NAME, guest_addr(d->name));
+    st32(guest + VITA_LUA_GUEST_DEBUG_NAMEWHAT, guest_addr(d->namewhat));
+    st32(guest + VITA_LUA_GUEST_DEBUG_WHAT, guest_addr(d->what));
+    st32(guest + VITA_LUA_GUEST_DEBUG_SOURCE, guest_addr(d->source));
+    st32(guest + VITA_LUA_GUEST_DEBUG_CURRENTLINE, (uint32_t)d->currentline);
+    st32(guest + VITA_LUA_GUEST_DEBUG_LINEDEFINED, (uint32_t)d->linedefined);
+    st32(guest + VITA_LUA_GUEST_DEBUG_LASTLINEDEFINED,
+         (uint32_t)d->lastlinedefined);
+    st8(guest + VITA_LUA_GUEST_DEBUG_NUPS, d->nups);
+    st8(guest + VITA_LUA_GUEST_DEBUG_NPARAMS, d->nparams);
+    st8(guest + VITA_LUA_GUEST_DEBUG_ISVARARG, (uint8_t)d->isvararg);
+    st8(guest + VITA_LUA_GUEST_DEBUG_ISTAILCALL, (uint8_t)d->istailcall);
+    for (i = 0U; i < LUA_IDSIZE; ++i)
+        st8(guest + VITA_LUA_GUEST_DEBUG_SHORT_SRC + i,
+            (uint8_t)d->short_src[i]);
+    st32(guest + VITA_LUA_GUEST_DEBUG_I_CI, guest_addr(d->i_ci));
+}
+
+#define VITA_LUA_SIZE_OUT(guest) vita_lua_size_out(guest)
+#define VITA_LUA_SIZE_STORE(guest) vita_lua_size_store(guest)
+#define VITA_LUA_DEBUG_IN(guest) vita_lua_debug_in(guest)
+#define VITA_LUA_DEBUG_OUT(guest) vita_lua_debug_out(guest)
+#else
+#define VITA_LUA_SIZE_OUT(guest) ((size_t *)guest_ptr(guest))
+#define VITA_LUA_SIZE_STORE(guest) ((void)0)
+#define VITA_LUA_DEBUG_IN(guest) ((lua_Debug *)guest_ptr(guest))
+#define VITA_LUA_DEBUG_OUT(guest) ((void)0)
+#endif
+
 static void vita_lua_tolstring_aux_import(CPU *__restrict c)
 {
     const char *result;
     VITA_LUA_BEGIN();
     result = luaL_tolstring(
         state, vita_lua_index((int32_t)vita_lua_arg(c, 1U)),
-        (size_t *)(uintptr_t)vita_lua_arg(c, 2U));
+        VITA_LUA_SIZE_OUT(vita_lua_arg(c, 2U)));
+    VITA_LUA_SIZE_STORE(vita_lua_arg(c, 2U));
     vita_lua_scope_leave(&scope);
     vita_lua_return_pointer(c, result);
 }
@@ -1652,7 +1780,7 @@ static void vita_lua_requiref_import(CPU *__restrict c)
     openfunction = vita_lua_builtin_openfunction(vita_lua_arg(c, 2U));
     if (openfunction) {
         luaL_requiref(state,
-                      (const char *)(uintptr_t)vita_lua_arg(c, 1U),
+                      (const char *)guest_ptr(vita_lua_arg(c, 1U)),
                       openfunction, (int32_t)vita_lua_arg(c, 3U));
         VITA_LUA_END();
         return;
@@ -1664,7 +1792,7 @@ static void vita_lua_requiref_import(CPU *__restrict c)
         return;
     }
     luaL_requiref(state,
-                  (const char *)(uintptr_t)vita_lua_arg(c, 1U),
+                  (const char *)guest_ptr(vita_lua_arg(c, 1U)),
                   vita_lua_guest_openfunction,
                   (int32_t)vita_lua_arg(c, 3U));
     vita_lua_require_pop(slot);
@@ -1730,7 +1858,8 @@ static void vita_lua_getstack_import(CPU *__restrict c)
     VITA_LUA_BEGIN();
     c->eax = (uint32_t)lua_getstack(
         state, (int32_t)vita_lua_arg(c, 1U),
-        (lua_Debug *)(uintptr_t)vita_lua_arg(c, 2U));
+        VITA_LUA_DEBUG_IN(vita_lua_arg(c, 2U)));
+    VITA_LUA_DEBUG_OUT(vita_lua_arg(c, 2U));
     VITA_LUA_END();
 }
 
@@ -1739,7 +1868,7 @@ static void vita_lua_pushstring_import(CPU *__restrict c)
     const char *result;
     VITA_LUA_BEGIN();
     result = lua_pushstring(
-        state, (const char *)(uintptr_t)vita_lua_arg(c, 1U));
+        state, (const char *)guest_ptr(vita_lua_arg(c, 1U)));
     vita_lua_scope_leave(&scope);
     vita_lua_return_pointer(c, result);
 }
@@ -1776,7 +1905,7 @@ static int vita_lua_push_guest_format(CPU *__restrict c, lua_State *state,
                                       uint32_t guest_format, uint32_t slot)
 {
     const char *cursor = guest_format
-        ? (const char *)(uintptr_t)guest_format : "(null)";
+        ? (const char *)guest_ptr(guest_format) : "(null)";
     int pieces = 0;
 
     for (;;) {
@@ -1795,7 +1924,7 @@ static int vita_lua_push_guest_format(CPU *__restrict c, lua_State *state,
         switch (percent[1]) {
         case 's':
             lua_pushfstring(state, "%s",
-                            (const char *)(uintptr_t)vita_lua_arg(c, slot));
+                            (const char *)guest_ptr(vita_lua_arg(c, slot)));
             slot += 1U;
             break;
         case 'c':
@@ -1817,7 +1946,7 @@ static int vita_lua_push_guest_format(CPU *__restrict c, lua_State *state,
             break;
         case 'p':
             lua_pushfstring(state, "%p",
-                            (void *)(uintptr_t)vita_lua_arg(c, slot));
+                            (void *)guest_ptr(vita_lua_arg(c, slot)));
             slot += 1U;
             break;
         case 'U':
@@ -1870,7 +1999,7 @@ static void vita_lua_atpanic_import(CPU *__restrict c)
     record = vita_lua_find_state(state);
     if (!record) {
         vita_lua_scope_leave(&scope);
-        guest_fault(c, (uint32_t)(uintptr_t)state,
+        guest_fault(c, guest_addr(state),
                     "lua_atpanic received an unregistered state");
         return;
     }
@@ -1885,7 +2014,7 @@ static void vita_lua_getglobal_import(CPU *__restrict c)
 {
     VITA_LUA_BEGIN();
     c->eax = (uint32_t)lua_getglobal(
-        state, (const char *)(uintptr_t)vita_lua_arg(c, 1U));
+        state, (const char *)guest_ptr(vita_lua_arg(c, 1U)));
     VITA_LUA_END();
 }
 
@@ -1916,7 +2045,7 @@ static void vita_lua_rawgetp_import(CPU *__restrict c)
     VITA_LUA_BEGIN();
     c->eax = (uint32_t)lua_rawgetp(
         state, vita_lua_index((int32_t)vita_lua_arg(c, 1U)),
-        (const void *)(uintptr_t)vita_lua_arg(c, 2U));
+        (const void *)guest_ptr(vita_lua_arg(c, 2U)));
     VITA_LUA_END();
 }
 
@@ -1924,13 +2053,13 @@ static void vita_lua_loadbufferx_import(CPU *__restrict c)
 {
     VITA_LUA_BEGIN();
     c->eax = (uint32_t)luaL_loadbufferx(
-        state, (const char *)(uintptr_t)vita_lua_arg(c, 1U),
+        state, (const char *)guest_ptr(vita_lua_arg(c, 1U)),
         (size_t)vita_lua_arg(c, 2U),
-        (const char *)(uintptr_t)vita_lua_arg(c, 3U),
-        (const char *)(uintptr_t)vita_lua_arg(c, 4U));
+        (const char *)guest_ptr(vita_lua_arg(c, 3U)),
+        (const char *)guest_ptr(vita_lua_arg(c, 4U)));
 #if defined(ISAAC_VITA_LUA_RECEIPT)
     vita_lua_receipt_load(state, "buffer",
-                          (const char *)(uintptr_t)vita_lua_arg(c, 3U),
+                          (const char *)guest_ptr(vita_lua_arg(c, 3U)),
                           (size_t)vita_lua_arg(c, 2U), (int)c->eax);
 #endif
     VITA_LUA_END();
@@ -1942,7 +2071,8 @@ static void vita_lua_tolstring_import(CPU *__restrict c)
     VITA_LUA_BEGIN();
     result = lua_tolstring(
         state, vita_lua_index((int32_t)vita_lua_arg(c, 1U)),
-        (size_t *)(uintptr_t)vita_lua_arg(c, 2U));
+        VITA_LUA_SIZE_OUT(vita_lua_arg(c, 2U)));
+    VITA_LUA_SIZE_STORE(vita_lua_arg(c, 2U));
     vita_lua_scope_leave(&scope);
     vita_lua_return_pointer(c, result);
 }
@@ -2013,7 +2143,7 @@ static void vita_lua_newstate_import(CPU *__restrict c)
 static void vita_lua_setglobal_import(CPU *__restrict c)
 {
     VITA_LUA_BEGIN();
-    lua_setglobal(state, (const char *)(uintptr_t)vita_lua_arg(c, 1U));
+    lua_setglobal(state, (const char *)guest_ptr(vita_lua_arg(c, 1U)));
     VITA_LUA_END();
 }
 
@@ -2091,7 +2221,7 @@ static void vita_lua_error_import(CPU *__restrict c)
         return;
     }
     if (frame->state != state) {
-        guest_fault(c, (uint32_t)(uintptr_t)state,
+        guest_fault(c, guest_addr(state),
                     "luaL_error state differs from the callback state");
         return;
     }
@@ -2110,7 +2240,7 @@ static void vita_lua_rawsetp_import(CPU *__restrict c)
 {
     VITA_LUA_BEGIN();
     lua_rawsetp(state, vita_lua_index((int32_t)vita_lua_arg(c, 1U)),
-                (const void *)(uintptr_t)vita_lua_arg(c, 2U));
+                (const void *)guest_ptr(vita_lua_arg(c, 2U)));
     VITA_LUA_END();
 }
 
@@ -2118,7 +2248,7 @@ static void vita_lua_setfield_import(CPU *__restrict c)
 {
     VITA_LUA_BEGIN();
     lua_setfield(state, vita_lua_index((int32_t)vita_lua_arg(c, 1U)),
-                 (const char *)(uintptr_t)vita_lua_arg(c, 2U));
+                 (const char *)guest_ptr(vita_lua_arg(c, 2U)));
     VITA_LUA_END();
 }
 
@@ -2161,7 +2291,8 @@ static void vita_lua_checklstring_import(CPU *__restrict c)
     VITA_LUA_BEGIN();
     result = luaL_checklstring(
         state, vita_lua_index((int32_t)vita_lua_arg(c, 1U)),
-        (size_t *)(uintptr_t)vita_lua_arg(c, 2U));
+        VITA_LUA_SIZE_OUT(vita_lua_arg(c, 2U)));
+    VITA_LUA_SIZE_STORE(vita_lua_arg(c, 2U));
     vita_lua_scope_leave(&scope);
     vita_lua_return_pointer(c, result);
 }
@@ -2187,7 +2318,7 @@ static void vita_lua_pushlstring_import(CPU *__restrict c)
     const char *result;
     VITA_LUA_BEGIN();
     result = lua_pushlstring(
-        state, (const char *)(uintptr_t)vita_lua_arg(c, 1U),
+        state, (const char *)guest_ptr(vita_lua_arg(c, 1U)),
         (size_t)vita_lua_arg(c, 2U));
     vita_lua_scope_leave(&scope);
     vita_lua_return_pointer(c, result);
@@ -2197,8 +2328,9 @@ static void vita_lua_getinfo_import(CPU *__restrict c)
 {
     VITA_LUA_BEGIN();
     c->eax = (uint32_t)lua_getinfo(
-        state, (const char *)(uintptr_t)vita_lua_arg(c, 1U),
-        (lua_Debug *)(uintptr_t)vita_lua_arg(c, 2U));
+        state, (const char *)guest_ptr(vita_lua_arg(c, 1U)),
+        VITA_LUA_DEBUG_IN(vita_lua_arg(c, 2U)));
+    VITA_LUA_DEBUG_OUT(vita_lua_arg(c, 2U));
     VITA_LUA_END();
 }
 
@@ -2349,11 +2481,11 @@ static void vita_lua_loadfilex_import(CPU *__restrict c)
     VITA_LUA_BEGIN();
     if (filename) {
         vita_lua_rebase_script_package_path(
-            state, (const char *)(uintptr_t)guest_filename, filename);
+            state, (const char *)guest_ptr(guest_filename), filename);
     }
     c->eax = (uint32_t)luaL_loadfilex(
         state, filename,
-        (const char *)(uintptr_t)vita_lua_arg(c, 2U));
+        (const char *)guest_ptr(vita_lua_arg(c, 2U)));
 #if defined(ISAAC_VITA_LUA_RECEIPT)
     vita_lua_receipt_load(state, "file", filename ? filename : "(stdin)",
                           vita_lua_receipt_file_bytes(filename), (int)c->eax);
@@ -2734,7 +2866,7 @@ unsigned g_isaac_vita_lua_fast_typed_runs;
         ++*call_count;                                                     \
     VITA_LUA_FAST_BEAT(c, index);                                          \
     guest_stack_note_low(c, esp + 4U);                                     \
-    state = (lua_State *)(uintptr_t)ld32(esp + 4U);                        \
+    state = (lua_State *)guest_ptr(ld32(esp + 4U));                        \
     if (!vita_lua_fast_scope_enter(c, &active))                            \
         return 1
 
@@ -2767,7 +2899,7 @@ static int vita_lua_fast_rawgetp(CPU *__restrict c, uint32_t index,
     VITA_LUA_FAST_BEGIN(16U);
     c->eax = (uint32_t)lua_rawgetp(
         state, vita_lua_index((int32_t)ld32(esp + 8U)),
-        (const void *)(uintptr_t)ld32(esp + 12U));
+        (const void *)guest_ptr(ld32(esp + 12U)));
     VITA_LUA_FAST_END();
 }
 
@@ -2795,7 +2927,7 @@ static int vita_lua_fast_touserdata(CPU *__restrict c, uint32_t index,
     void *result;
     VITA_LUA_FAST_BEGIN(12U);
     result = lua_touserdata(state, vita_lua_index((int32_t)ld32(esp + 8U)));
-    VITA_LUA_FAST_END_STORE(c->eax = (uint32_t)(uintptr_t)result);
+    VITA_LUA_FAST_END_STORE(c->eax = guest_addr(result));
 }
 
 static int vita_lua_fast_pushvalue(CPU *__restrict c, uint32_t index,
@@ -2870,8 +3002,8 @@ static int vita_lua_fast_pushstring(CPU *__restrict c, uint32_t index,
 {
     const char *result;
     VITA_LUA_FAST_BEGIN(12U);
-    result = lua_pushstring(state, (const char *)(uintptr_t)ld32(esp + 8U));
-    VITA_LUA_FAST_END_STORE(c->eax = (uint32_t)(uintptr_t)result);
+    result = lua_pushstring(state, (const char *)guest_ptr(ld32(esp + 8U)));
+    VITA_LUA_FAST_END_STORE(c->eax = guest_addr(result));
 }
 
 #undef VITA_LUA_FAST_BEGIN

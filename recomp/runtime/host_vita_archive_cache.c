@@ -30,12 +30,25 @@ void isaac_vita_archive_cache_oracle_clearerr(FILE *stream);
 #define ISAAC_VITA_ARCHIVE_CACHE_PREFIX \
     ISAAC_VITA_NATIVE_DATA_ROOT "/resources/packed/"
 
+/* The Vita keeps a single idle descriptor (its FILE budget is tight).  The
+ * 64-bit hosts keep one per archive: the game reopens an archive for every
+ * asset it loads, and on the Switch each reopen is several SD card service
+ * calls (open, size, close) in the middle of a room transition. */
+#if defined(GUEST_MEM_WINDOW)
+#define ISAAC_VITA_ARCHIVE_CACHE_IDLE_SLOTS 24U
+#else
+#define ISAAC_VITA_ARCHIVE_CACHE_IDLE_SLOTS 1U
+#endif
+
 typedef struct isaac_vita_archive_cache_idle {
     FILE *stream;
+    uint32_t age;
     char key[ISAAC_VITA_ARCHIVE_CACHE_KEY_CAPACITY];
 } isaac_vita_archive_cache_idle;
 
-static isaac_vita_archive_cache_idle s_idle;
+static isaac_vita_archive_cache_idle
+    s_idle_slots[ISAAC_VITA_ARCHIVE_CACHE_IDLE_SLOTS];
+static uint32_t s_idle_age;
 static isaac_vita_archive_diag_event
     s_archive_diag_ring[ISAAC_VITA_ARCHIVE_DIAG_RING_CAPACITY];
 static uint32_t s_archive_diag_sequence;
@@ -178,24 +191,59 @@ int isaac_vita_archive_cache_key(
     return 1;
 }
 
-static int archive_cache_drop_idle(void)
+static int archive_cache_drop_slot(isaac_vita_archive_cache_idle *slot)
 {
-    FILE *stream = s_idle.stream;
+    FILE *stream = slot->stream;
 
-    s_idle.stream = NULL;
-    s_idle.key[0] = '\0';
+    slot->stream = NULL;
+    slot->key[0] = '\0';
     if (!stream)
         return 0;
     return archive_native_fclose(stream);
 }
 
+static int archive_cache_drop_idle(void)
+{
+    int result = 0;
+    uint32_t i;
+
+    for (i = 0U; i < ISAAC_VITA_ARCHIVE_CACHE_IDLE_SLOTS; ++i)
+        if (archive_cache_drop_slot(&s_idle_slots[i]) != 0)
+            result = EOF;
+    return result;
+}
+
+static int archive_cache_any_idle(void)
+{
+    uint32_t i;
+
+    for (i = 0U; i < ISAAC_VITA_ARCHIVE_CACHE_IDLE_SLOTS; ++i)
+        if (s_idle_slots[i].stream)
+            return 1;
+    return 0;
+}
+
+static isaac_vita_archive_cache_idle *archive_cache_find_idle(
+    const char *key)
+{
+    uint32_t i;
+
+    for (i = 0U; i < ISAAC_VITA_ARCHIVE_CACHE_IDLE_SLOTS; ++i)
+        if (s_idle_slots[i].stream && strcmp(s_idle_slots[i].key, key) == 0)
+            return &s_idle_slots[i];
+    return NULL;
+}
+
 /* Eviction is not part of the fopen being requested.  In particular, a stale
- * idle close error must not become the errno reported for a later open. */
+ * idle close error must not become the errno reported for a later open.
+ * Only the single-slot (Vita) cache evicts before an open; with a slot per
+ * archive the descriptor count is bounded by the archive count. */
 static void archive_cache_evict_before_open(void)
 {
     int saved_errno = errno;
 
-    (void)archive_cache_drop_idle();
+    if (ISAAC_VITA_ARCHIVE_CACHE_IDLE_SLOTS == 1U)
+        (void)archive_cache_drop_idle();
     errno = saved_errno;
 }
 
@@ -221,15 +269,16 @@ FILE *isaac_vita_archive_cache_open(isaac_vita_archive_cache_file *file,
     archive_cache_file_clear(file);
     cacheable = isaac_vita_archive_cache_key(native_path, mode, key);
 
-    if (cacheable && s_idle.stream && strcmp(s_idle.key, key) == 0) {
+    if (cacheable && archive_cache_find_idle(key)) {
+        isaac_vita_archive_cache_idle *slot = archive_cache_find_idle(key);
         isaac_vita_archive_diag_event event;
         long reset_position = -1L;
         int reset_result;
         int reset_errno;
 
-        stream = s_idle.stream;
-        s_idle.stream = NULL;
-        s_idle.key[0] = '\0';
+        stream = slot->stream;
+        slot->stream = NULL;
+        slot->key[0] = '\0';
         errno = 0;
         reset_result = archive_native_fseek(stream, 0L, SEEK_SET);
         reset_errno = errno;
@@ -277,9 +326,10 @@ FILE *isaac_vita_archive_cache_open(isaac_vita_archive_cache_file *file,
             (void)archive_native_fclose(stream);
             errno = saved_errno;
         }
-    } else if (s_idle.stream) {
+    } else if (archive_cache_any_idle()) {
         /* This includes non-cacheable opens.  The idle descriptor is gone
-         * before native fopen, so the cache can never cause a +2 FILE peak. */
+         * before native fopen, so the cache can never cause a +2 FILE peak
+         * (single-slot cache only). */
         archive_cache_evict_before_open();
     }
 
@@ -305,13 +355,30 @@ int isaac_vita_archive_cache_close(isaac_vita_archive_cache_file *file)
     if (!file->key[0])
         return archive_native_fclose(stream);
 
-    if (s_idle.stream) {
-        int saved_errno = errno;
-        (void)archive_cache_drop_idle();
-        errno = saved_errno;
+    {
+        isaac_vita_archive_cache_idle *slot = NULL;
+        uint32_t i;
+
+        /* a free slot, else the least recently parked one */
+        for (i = 0U; i < ISAAC_VITA_ARCHIVE_CACHE_IDLE_SLOTS; ++i) {
+            isaac_vita_archive_cache_idle *candidate = &s_idle_slots[i];
+
+            if (!candidate->stream) {
+                slot = candidate;
+                break;
+            }
+            if (!slot || candidate->age < slot->age)
+                slot = candidate;
+        }
+        if (slot->stream) {
+            int saved_errno = errno;
+            (void)archive_cache_drop_slot(slot);
+            errno = saved_errno;
+        }
+        slot->stream = stream;
+        slot->age = ++s_idle_age;
+        memcpy(slot->key, file->key, strlen(file->key) + 1U);
     }
-    s_idle.stream = stream;
-    memcpy(s_idle.key, file->key, strlen(file->key) + 1U);
     file->key[0] = '\0';
     return 0;
 }
@@ -342,7 +409,7 @@ FILE *isaac_vita_archive_cache_reopen_native(const char *native_path,
         errno = EINVAL;
         return NULL;
     }
-    if (s_idle.stream)
+    if (archive_cache_any_idle())
         archive_cache_evict_before_open();
     return archive_native_fopen(native_path, mode);
 }

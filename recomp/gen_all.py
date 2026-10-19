@@ -46,6 +46,7 @@ from gpr_locals import (BOUNDARY_CALLS_RE as GPR_BOUNDARY_CALLS_RE,  # noqa: E40
                         bracket_seam_regions, collapse_leaf_inline,
                         legacy_statements, legacy_text)
 import leaf_inline                                           # noqa: E402
+import cxx_eh                                                # noqa: E402
 import bounds as Bounds                                      # noqa: E402
 import build_contract as BC                                  # noqa: E402
 import funcs as Funcs                                        # noqa: E402
@@ -16195,7 +16196,7 @@ def contract_recipe(functions_manifest, bounds_manifest):
     source_names = (
         "gen_all.py", "build_one.py", "emit.py", "trans.py", "image.py",
         "iat_meta.py", "sweep2.py", "build_contract.py", "leaf_inline.py",
-        "sse_lower.py", "gpr_locals.py",
+        "sse_lower.py", "gpr_locals.py", "cxx_eh.py",
     )
     inputs = {
         "input/isaac-ng.exe.unpacked.exe": EXE,
@@ -16243,6 +16244,10 @@ def contract_recipe(functions_manifest, bounds_manifest):
                 leaf_inline.max_insns_from_environment()
                 if leaf_inline.enabled_by_environment() else 0
             ),
+            # MSVC C++ EH lowering (GUEST_CXX_EH, cxx_eh.py): funclet roots,
+            # catch continuations and native landing sites.  Recorded only
+            # when on, so the default recipe is unchanged.
+            **({"cxx_eh": True} if cxx_eh.enabled() else {}),
         },
         BC.tool_ids(),
     )
@@ -22669,7 +22674,7 @@ _SETJMP_THUNK_VALIDATED = False
 def _translation_worker_init(known, switch_info, function_coverage_ids=None,
                              case_coverage_ids=None,
                              image_base=DEFAULT_BASE, import_ids=None,
-                             leaf_inline_table=None):
+                             leaf_inline_table=None, cxx_eh_table=None):
     """Build one private PE image per process; Capstone objects are not IPC-safe."""
     global _WORKER_IMAGE, _WORKER_PIN_IMAGE
     global _WORKER_KNOWN, _WORKER_SWITCH_INFO
@@ -22679,6 +22684,7 @@ def _translation_worker_init(known, switch_info, function_coverage_ids=None,
     # The proven tiny-leaf table (None: no direct call is inlined) is a
     # module global consulted by the emitter; spawn workers must be told.
     leaf_inline.TABLE = leaf_inline_table
+    cxx_eh.TABLE = cxx_eh_table
     _WORKER_IMAGE = Image(EXE, image_base)
     _WORKER_PIN_IMAGE = (_WORKER_IMAGE if image_base == DEFAULT_BASE
                          else Image(EXE, DEFAULT_BASE))
@@ -22826,6 +22832,9 @@ def _translate_function(img, fn, known, switch_info,
             "manual": rva in MANUAL_RVAS,
             "stub": "decode: %s" % type(ex).__name__,
         }
+
+    # GUEST_CXX_EH landing sites decoded into this body (cxx_eh.py).
+    eh_anchor_sites = cxx_eh.anchors_in(_insns)
 
     # This must precede every unsupported/stub return.  A shared translated
     # root may contain a physical seam even when its own body cannot emit C.
@@ -23224,6 +23233,9 @@ def _translate_function(img, fn, known, switch_info,
     if setjmp_sites:
         lines.append("    guest_jump_site _guest_setjmp_site_%08x = {0};"
                      % setjmp_sites[0])
+    eh_rendered_returns = 0
+    if eh_anchor_sites:
+        lines.extend(cxx_eh.render_declarations(eh_anchor_sites))
     function_entry_hook_id = None
     if function_coverage_ids is not None and rva not in MANUAL_RVAS:
         try:
@@ -25114,6 +25126,20 @@ def _translate_function(img, fn, known, switch_info,
         else:
             for statement in stmts:
                 lines.append("    %s" % statement)
+        if ins.address in eh_anchor_sites:
+            if (ins.mnemonic != "push" or
+                    legacy_statements(stmts) != (
+                        "gpush_generated(c, 0x%xU); "
+                        "GUEST_STACK_CALLSITE_BARRIER();" %
+                        ((img.base + cxx_eh.TABLE["anchors"][ins.address]
+                          ["handler"]) & 0xFFFFFFFF),)):
+                raise RuntimeError(
+                    "C++ EH handler push rendering changed at %08x" %
+                    ins.address)
+            eh_lines = cxx_eh.render_anchor(ins.address, img.base, known)
+            eh_rendered_returns += sum(line.count("return;")
+                                       for line in eh_lines)
+            lines.extend(eh_lines)
         if (vita_original_effects_profile and
                 ins.address in (VITA_ORIGINAL_EFFECTS_PROFILE_SITE_RVA,
                                 VITA_ORIGINAL_EFFECTS_PROFILE_DEFAULT_SITE_RVA)):
@@ -25223,7 +25249,10 @@ def _translate_function(img, fn, known, switch_info,
                                          len(legacy_text(text)))
         text = published_text
         lines = text.splitlines()
-    if vita_anm2_outer and text.count("return;") != VITA_ANM2_OUTER_C_RETURNS:
+    # The C++ EH landing returns are the second setjmp return of the same
+    # function scope; the ANM2 token still closes on them (cleanup runs).
+    if vita_anm2_outer and (text.count("return;") - eh_rendered_returns !=
+                            VITA_ANM2_OUTER_C_RETURNS):
         raise RuntimeError("ANM2 whole-loader ordinary return census changed")
     legacy_size_delta = 0
     if em.iat_jmp_sites:
@@ -25377,6 +25406,10 @@ def _translate_function(img, fn, known, switch_info,
         # and the sites kept as calls, by reason, for the generation census.
         "leaf_inline_sites": tuple(getattr(em, "leaf_inlined", ())),
         "leaf_inline_refused": dict(getattr(em, "leaf_refused", {})),
+        # GUEST_CXX_EH landing sites rendered in this body; the field is
+        # absent when there are none so result-shape seams stay unchanged.
+        **({"cxx_eh_anchor_sites": eh_anchor_sites}
+           if eh_anchor_sites else {}),
     }
 
 
@@ -25873,6 +25906,25 @@ def _main(force=False, reanalyse=False, jobs=1):
     # set is a target recursive descent invented from data, and must fault
     # loudly rather than become an undefined symbol.
     known = set(canonical_roots | lua_callback_roots | push_imm_roots)
+    # GUEST_CXX_EH: catch/unwind funclets and catch continuations are reached
+    # only from the EH tables; give the ones no other root covers a
+    # supplemental root of their own (after every canonical unit, like the
+    # push-imm roots).
+    cxx_eh_table = None
+    cxx_eh_functions = ()
+    if cxx_eh.enabled():
+        cxx_eh_table = cxx_eh.validate(cxx_eh.discover(img, imports))
+        cxx_eh_functions = tuple(
+            {"rva": rva, "end": rva, "size": 0}
+            for rva in cxx_eh.supplemental_roots(cxx_eh_table)
+            if rva not in known)
+        known.update(fn["rva"] for fn in cxx_eh_functions)
+        print("C++ EH tables              : %d FuncInfo / %d with try / "
+              "%d landing sites / %d continuations / %d funclet roots"
+              % (cxx_eh_table["funcinfos"], cxx_eh_table["try_funcinfos"],
+                 len(cxx_eh_table["anchors"]),
+                 cxx_eh_table["continuations"], len(cxx_eh_functions)))
+    cxx_eh.TABLE = cxx_eh_table
     coverage = build_coverage_inventory(canonical_roots, imports, switch_info)
     manual_coverage_hook_count = validate_manual_coverage_hooks()
 
@@ -25975,6 +26027,7 @@ def _main(force=False, reanalyse=False, jobs=1):
     pc_display_dimension_roots = {}
     setjmp_site_roots = {site: set() for site in SETJMP_CALL_SPECS}
     generic_setjmp_thunk_calls = 0
+    cxx_eh_seen_anchors = set()
     coverage_entry_hook_ids = []
     coverage_cross_root_hooks = []
     coverage_case_hooks = []
@@ -26038,7 +26091,8 @@ def _main(force=False, reanalyse=False, jobs=1):
             processes=jobs, initializer=_translation_worker_init,
             initargs=(tuple(sorted(known)), switch_info,
                       coverage["function_ids"], coverage["case_ids"],
-                      IMAGE_BASE, import_ids, leaf_inline_table),
+                      IMAGE_BASE, import_ids, leaf_inline_table,
+                      cxx_eh_table),
         )
         # imap preserves canonical function order, hence unit boundaries and
         # every output byte, while keeping only a small result window in RAM.
@@ -26077,6 +26131,7 @@ def _main(force=False, reanalyse=False, jobs=1):
                 result["coverage_cross_root_hooks"])
             coverage_case_hooks.extend(result["coverage_case_hooks"])
 
+            cxx_eh_seen_anchors.update(result.get("cxx_eh_anchor_sites", ()))
             if result["partial_unsupported"]:
                 partial_roots += 1
                 partial_unsupported += result["partial_unsupported"]
@@ -26685,6 +26740,58 @@ def _main(force=False, reanalyse=False, jobs=1):
             len(push_imm_emitted) != PUSH_IMM_SUPPLEMENTAL_TARGETS):
         raise RuntimeError("supplemental push-imm root emission changed")
 
+    # GUEST_CXX_EH funclet roots: plain translations, no coverage IDs.
+    cxx_eh_stubs = []
+    cxx_eh_seam_blocked = set()
+    for fn in cxx_eh_functions:
+        try:
+            result = _translate_function(
+                emit_img, fn, known, {}, None, None, img)
+        except RuntimeError as ex:
+            # Only the pinned continuations may meet a seam proof; any other
+            # refusal is a real generator failure.
+            if fn["rva"] not in cxx_eh.SEAM_BLOCKED_CONTINUATIONS:
+                raise
+            cxx_eh_seam_blocked.add(fn["rva"])
+            public_name, name = function_symbols(fn["rva"])
+            names.append((fn["rva"], public_name))
+            cxx_eh_stubs.append((fn["rva"], name,
+                                 "C++ catch continuation in a pinned seam "
+                                 "owner (%s)" % ex))
+            continue
+        names.append((result["rva"], result["public_name"]))
+        if result["stub"] is not None:
+            cxx_eh_stubs.append((result["rva"], result["name"],
+                                 result["stub"]))
+            continue
+        text = result["text"]
+        cxx_eh_seen_anchors.update(result.get("cxx_eh_anchor_sites", ()))
+        entry_gates += int(result["entry_gate"])
+        insns_total += result["insns"]
+        total_lines += result["lines"]
+        total_bytes += len(text)
+        unit.append(text)
+        unit_bytes += unit_packing_size(text)
+        if unit_bytes >= TARGET_BYTES:
+            flush()
+    flush()
+    if cxx_eh_table is not None:
+        print("C++ EH supplemental roots  : %d translated / %d stubbed"
+              % (len(cxx_eh_functions) - len(cxx_eh_stubs),
+                 len(cxx_eh_stubs)))
+        if cxx_eh_seam_blocked != cxx_eh.SEAM_BLOCKED_CONTINUATIONS:
+            raise RuntimeError(
+                "C++ EH seam-blocked continuations changed: %s" % ",".join(
+                    "%08x" % rva for rva in sorted(cxx_eh_seam_blocked)))
+        missing = set(cxx_eh_table["anchors"]) - cxx_eh_seen_anchors
+        print("C++ EH landing sites       : %d of %d emitted"
+              % (len(cxx_eh_seen_anchors), len(cxx_eh_table["anchors"])))
+        if missing:
+            # The owner is a stub or unreachable: a catch there would stop
+            # loudly at run time ("no native landing site").
+            print("C++ EH sites without body  : %s" % ", ".join(
+                "%08x" % site for site in sorted(missing)))
+
     # ---- loud stubs -------------------------------------------------------
     with _open_generated_text(os.path.join(OUTDIR, "guest_stubs.c")) as fh:
         fh.write("/* GENERATED -- functions the emitter could not translate.\n"
@@ -26698,10 +26805,27 @@ def _main(force=False, reanalyse=False, jobs=1):
                          % coverage["function_ids"][rva])
             fh.write("    guest_fault(c, 0x%xU, \"untranslated: %s\");\n"
                      "}\n\n" % (rva, why.replace('"', "'")))
+        for rva, name, why in cxx_eh_stubs:
+            fh.write("void %s(CPU *__restrict c)\n{\n" % name)
+            fh.write("    guest_fault(c, 0x%xU, \"untranslated C++ EH "
+                     "funclet: %s\");\n"
+                     "}\n\n" % (rva, why.replace('"', "'")))
 
     # ---- prototypes -------------------------------------------------------
     with _open_generated_text(os.path.join(OUTDIR, "guest_funcs.h")) as fh:
-        fh.write(render_guest_funcs_header(names, manual_originals))
+        header = render_guest_funcs_header(names, manual_originals)
+        if cxx_eh_table is not None:
+            # The landing sites need the runtime's guest_eh_* half.
+            marker = ("#define GUEST_CXX_EH_CORPUS 1\n"
+                      "#if !GUEST_CXX_EH\n"
+                      "#error \"generated with GUEST_CXX_EH=1: build the "
+                      "runtime with GUEST_CXX_EH=1\"\n"
+                      "#endif\n\n")
+            anchor = "#include \"guest.h\"\n\n"
+            if header.count(anchor) != 1:
+                raise RuntimeError("guest_funcs.h header shape changed")
+            header = header.replace(anchor, anchor + marker)
+        fh.write(header)
 
     schema_id = write_coverage_contract(
         coverage, coverage_emission, stub_rvas, recipe_id, generation_id)

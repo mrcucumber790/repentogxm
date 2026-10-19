@@ -11,7 +11,7 @@
 #define ISAAC_NP_ADLER_NEON_AVAILABLE 1
 #else
 #define ISAAC_NP_ADLER_NEON_AVAILABLE 0
-#if ISAAC_VITA_NATIVE_PNG_ADLER_NEON && defined(__vita__)
+#if ISAAC_VITA_NATIVE_PNG_ADLER_NEON && defined(__vita__) && defined(__arm__)
 #error "Native PNG Adler NEON requires the target ARM NEON contract"
 #endif
 #endif

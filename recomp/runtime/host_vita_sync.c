@@ -158,12 +158,12 @@ int isaac_vita_sync_cs_enter(CPU *__restrict c, uint32_t address)
     thread_id = vita_sync_bound_thread_id(c);
     if (thread_id > 0) {
         result = isaac_vita_sync_lock_userspace_mutex_for_thread(
-            (uint32_t *)(uintptr_t)(address + 16U),
-            (uint32_t *)(uintptr_t)(address + 20U), thread_id);
+            (uint32_t *)guest_ptr(address + 16U),
+            (uint32_t *)guest_ptr(address + 20U), thread_id);
     } else {
         result = isaac_vita_sync_lock_userspace_mutex(
-            (uint32_t *)(uintptr_t)(address + 16U),
-            (uint32_t *)(uintptr_t)(address + 20U));
+            (uint32_t *)guest_ptr(address + 16U),
+            (uint32_t *)guest_ptr(address + 20U));
     }
     if (result < 0) {
         isaac_vita_sync_log_failure("VitaEmbeddedMutexLock", result);
@@ -183,12 +183,12 @@ int isaac_vita_sync_cs_leave(CPU *__restrict c, uint32_t address)
     thread_id = vita_sync_bound_thread_id(c);
     if (thread_id > 0) {
         result = isaac_vita_sync_unlock_userspace_mutex_for_thread(
-            (uint32_t *)(uintptr_t)(address + 16U),
-            (uint32_t *)(uintptr_t)(address + 20U), thread_id);
+            (uint32_t *)guest_ptr(address + 16U),
+            (uint32_t *)guest_ptr(address + 20U), thread_id);
     } else {
         result = isaac_vita_sync_unlock_userspace_mutex(
-            (uint32_t *)(uintptr_t)(address + 16U),
-            (uint32_t *)(uintptr_t)(address + 20U));
+            (uint32_t *)guest_ptr(address + 16U),
+            (uint32_t *)guest_ptr(address + 20U));
     }
     if (result < 0) {
         isaac_vita_sync_log_failure("VitaEmbeddedMutexUnlock", result);
@@ -206,8 +206,8 @@ int isaac_vita_sync_cs_delete(CPU *__restrict c, uint32_t address)
     if (!vita_sync_cs_validate(c, address))
         return 0;
     result = isaac_vita_sync_delete_userspace_mutex(
-        (uint32_t *)(uintptr_t)(address + 16U),
-        (uint32_t *)(uintptr_t)(address + 20U));
+        (uint32_t *)guest_ptr(address + 16U),
+        (uint32_t *)guest_ptr(address + 20U));
     if (result < 0) {
         isaac_vita_sync_log_failure("VitaEmbeddedMutexDelete", result);
         vita_sync_fault(c, address, "Vita recursive mutex deletion failed");
@@ -381,12 +381,12 @@ static void vita_sync_TryEnterCriticalSection(CPU *__restrict c)
     thread_id = vita_sync_bound_thread_id(c);
     if (thread_id > 0) {
         result = isaac_vita_sync_try_lock_userspace_mutex_for_thread(
-            (uint32_t *)(uintptr_t)(address + 16U),
-            (uint32_t *)(uintptr_t)(address + 20U), thread_id);
+            (uint32_t *)guest_ptr(address + 16U),
+            (uint32_t *)guest_ptr(address + 20U), thread_id);
     } else {
         result = isaac_vita_sync_try_lock_userspace_mutex(
-            (uint32_t *)(uintptr_t)(address + 16U),
-            (uint32_t *)(uintptr_t)(address + 20U));
+            (uint32_t *)guest_ptr(address + 16U),
+            (uint32_t *)guest_ptr(address + 20U));
     }
     if (result < 0) {
         isaac_vita_sync_log_failure(

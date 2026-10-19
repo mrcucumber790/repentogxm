@@ -5301,7 +5301,7 @@ static void vita_heap_free(CPU *__restrict c)
     {
         isaac_vita_ogg_emergency_decision emergency;
         int emergency_result = isaac_vita_ogg_emergency_free(
-            (void *)(uintptr_t)pointer, &emergency);
+            (void *)guest_ptr(pointer), &emergency);
 
         if (emergency_result == ISAAC_VITA_OGG_EMERGENCY_REJECTED) {
             guest_fault(c, emergency.fault_value, emergency.fault);
@@ -5317,7 +5317,7 @@ static void vita_heap_free(CPU *__restrict c)
              * (test_ogg_emergency.sh: heap_routing_oracle asserts once.) */
 #if defined(__GNUC__)
             if (isaac_nv_guest_buffer_freed)
-                isaac_nv_guest_buffer_freed((void *)(uintptr_t)pointer);
+                isaac_nv_guest_buffer_freed((void *)guest_ptr(pointer));
 #endif
             vita_heap_cdecl_return(c);
             return;
@@ -5327,7 +5327,7 @@ static void vita_heap_free(CPU *__restrict c)
 #ifdef ISAAC_VITA_ANM2_SCRATCH
     isaac_vita_anm2_scratch_decision scratch;
     int scratch_result = isaac_vita_anm2_scratch_free(
-        (void *)(uintptr_t)pointer, &scratch);
+        (void *)guest_ptr(pointer), &scratch);
 
     if (scratch_result == ISAAC_VITA_ANM2_SCRATCH_REJECTED) {
         guest_fault(c, scratch.fault_value, scratch.fault);
@@ -5342,7 +5342,7 @@ static void vita_heap_free(CPU *__restrict c)
     {
         isaac_vita_texel_scratch_decision scratch;
         int scratch_result = isaac_vita_texel_scratch_free(
-            (void *)(uintptr_t)pointer, &scratch);
+            (void *)guest_ptr(pointer), &scratch);
 
         if (scratch_result == ISAAC_VITA_TEXEL_SCRATCH_REJECTED) {
             guest_fault(c, scratch.fault_value, scratch.fault);
@@ -5361,7 +5361,7 @@ static void vita_heap_free(CPU *__restrict c)
         uint32_t free_return_rva = vita_heap_import_return_rva(c);
 
         slab_result = vita_heap_room_slab_free_route(
-            (void *)(uintptr_t)pointer, free_return_rva, &room);
+            (void *)guest_ptr(pointer), free_return_rva, &room);
         if (slab_result == ISAAC_VITA_ROOM_ENTRY_SLAB_TERMINAL ||
             isaac_vita_guest_heap_terminal()) {
             guest_fault(c, pointer, "room-entry slab is corrupted");
@@ -5381,7 +5381,7 @@ static void vita_heap_free(CPU *__restrict c)
     {
         vita_heap_router_result router_result;
         int freed = vita_heap_guest_free_impl(
-            (void *)(uintptr_t)pointer, &router_result);
+            (void *)guest_ptr(pointer), &router_result);
 
         if (router_result == VITA_HEAP_ROUTER_TERMINAL ||
             isaac_vita_guest_heap_terminal()) {
@@ -5394,7 +5394,7 @@ static void vita_heap_free(CPU *__restrict c)
         }
     }
 #else
-    if (!isaac_vita_guest_free((void *)(uintptr_t)pointer)) {
+    if (!isaac_vita_guest_free((void *)guest_ptr(pointer))) {
         guest_fault(c, pointer, "free received a foreign guest pointer");
         return;
     }
@@ -5425,10 +5425,10 @@ static void vita_heap_calloc(CPU *__restrict c)
                     "guest heap overflow domain is corrupted");
         return;
     }
-    c->eax = (uint32_t)(uintptr_t)result;
+    c->eax = guest_addr(result);
 #else
-    c->eax = (uint32_t)(uintptr_t)isaac_vita_guest_calloc(
-        (size_t)vita_heap_arg(c, 0U), (size_t)vita_heap_arg(c, 1U));
+    c->eax = guest_addr(isaac_vita_guest_calloc(
+        (size_t)vita_heap_arg(c, 0U), (size_t)vita_heap_arg(c, 1U)));
 #endif
     vita_heap_cdecl_return(c);
 }
@@ -5468,7 +5468,7 @@ static void vita_heap_malloc(CPU *__restrict c)
             return;
         }
         if (scratch_result == ISAAC_VITA_ANM2_SCRATCH_HANDLED) {
-            c->eax = (uint32_t)(uintptr_t)scratch.pointer;
+            c->eax = guest_addr(scratch.pointer);
             vita_heap_cdecl_return(c);
             return;
         }
@@ -5501,7 +5501,7 @@ static void vita_heap_malloc(CPU *__restrict c)
             return;
         }
         if (scratch_result == ISAAC_VITA_TEXEL_SCRATCH_HANDLED) {
-            c->eax = (uint32_t)(uintptr_t)scratch.pointer;
+            c->eax = guest_addr(scratch.pointer);
             vita_heap_cdecl_return(c);
             return;
         }
@@ -5538,7 +5538,7 @@ static void vita_heap_malloc(CPU *__restrict c)
                 return;
             }
             if (slab_result == ISAAC_VITA_ROOM_ENTRY_SLAB_HANDLED) {
-                c->eax = (uint32_t)(uintptr_t)room.pointer;
+                c->eax = guest_addr(room.pointer);
                 vita_heap_cdecl_return(c);
                 return;
             }
@@ -5627,10 +5627,10 @@ static void vita_heap_malloc(CPU *__restrict c)
         }
     }
 #endif
-    c->eax = (uint32_t)(uintptr_t)result;
+    c->eax = guest_addr(result);
 #else
-    c->eax = (uint32_t)(uintptr_t)isaac_vita_guest_malloc(
-        (size_t)vita_heap_arg(c, 0U));
+    c->eax = guest_addr(isaac_vita_guest_malloc(
+        (size_t)vita_heap_arg(c, 0U)));
 #endif
     vita_heap_cdecl_return(c);
 }
@@ -5667,14 +5667,14 @@ static void vita_heap_realloc(CPU *__restrict c)
     {
         isaac_vita_ogg_emergency_decision emergency;
         int emergency_result = isaac_vita_ogg_emergency_realloc(
-            (void *)(uintptr_t)pointer, size, &emergency);
+            (void *)guest_ptr(pointer), size, &emergency);
 
         if (emergency_result == ISAAC_VITA_OGG_EMERGENCY_REJECTED) {
             guest_fault(c, emergency.fault_value, emergency.fault);
             return;
         }
         if (emergency_result == ISAAC_VITA_OGG_EMERGENCY_HANDLED) {
-            c->eax = (uint32_t)(uintptr_t)emergency.pointer;
+            c->eax = guest_addr(emergency.pointer);
             vita_heap_cdecl_return(c);
             return;
         }
@@ -5684,14 +5684,14 @@ static void vita_heap_realloc(CPU *__restrict c)
     {
         isaac_vita_texel_scratch_decision scratch;
         int scratch_result = isaac_vita_texel_scratch_realloc(
-            (void *)(uintptr_t)pointer, size, &scratch);
+            (void *)guest_ptr(pointer), size, &scratch);
 
         if (scratch_result == ISAAC_VITA_TEXEL_SCRATCH_REJECTED) {
             guest_fault(c, scratch.fault_value, scratch.fault);
             return;
         }
         if (scratch_result == ISAAC_VITA_TEXEL_SCRATCH_HANDLED) {
-            c->eax = (uint32_t)(uintptr_t)scratch.pointer;
+            c->eax = guest_addr(scratch.pointer);
             vita_heap_cdecl_return(c);
             return;
         }
@@ -5704,7 +5704,7 @@ static void vita_heap_realloc(CPU *__restrict c)
         void *room_pointer = NULL;
 
         slab_result = vita_heap_room_slab_realloc_route(
-            (void *)(uintptr_t)pointer, size, &room, &room_pointer);
+            (void *)guest_ptr(pointer), size, &room, &room_pointer);
         if (slab_result == ISAAC_VITA_ROOM_ENTRY_SLAB_TERMINAL ||
             isaac_vita_guest_heap_terminal()) {
             guest_fault(c, pointer, "room-entry slab is corrupted");
@@ -5715,7 +5715,7 @@ static void vita_heap_realloc(CPU *__restrict c)
             return;
         }
         if (slab_result == ISAAC_VITA_ROOM_ENTRY_SLAB_HANDLED) {
-            c->eax = (uint32_t)(uintptr_t)room_pointer;
+            c->eax = guest_addr(room_pointer);
             vita_heap_cdecl_return(c);
             return;
         }
@@ -5725,7 +5725,7 @@ static void vita_heap_realloc(CPU *__restrict c)
 #ifdef ISAAC_VITA_HEAP_OVERFLOW_MSPACE
     vita_heap_router_result router_result;
     void *result = vita_heap_guest_realloc_impl(
-        (void *)(uintptr_t)pointer, size, &valid_owner, 0, NULL,
+        (void *)guest_ptr(pointer), size, &valid_owner, 0, NULL,
         &router_result);
     if (router_result == VITA_HEAP_ROUTER_TERMINAL ||
         isaac_vita_guest_heap_terminal()) {
@@ -5734,13 +5734,13 @@ static void vita_heap_realloc(CPU *__restrict c)
     }
 #else
     void *result = isaac_vita_guest_realloc(
-        (void *)(uintptr_t)pointer, size, &valid_owner);
+        (void *)guest_ptr(pointer), size, &valid_owner);
 #endif
     if (!valid_owner) {
         guest_fault(c, pointer, "realloc received a foreign guest pointer");
         return;
     }
-    c->eax = (uint32_t)(uintptr_t)result;
+    c->eax = guest_addr(result);
     vita_heap_cdecl_return(c);
 }
 

@@ -42,8 +42,8 @@ int isaac_vita_png_crc32_guest_try(CPU *__restrict c)
         return 0;
 
     result = isaac_vita_png_crc32_native(
-        c->ecx, (const uint8_t *)(uintptr_t)data, size,
-        (const uint32_t *)(uintptr_t)ISAAC_VITA_PNG_CRC32_TABLE_ADDRESS);
+        c->ecx, (const uint8_t *)guest_ptr(data), size,
+        (const uint32_t *)guest_ptr(ISAAC_VITA_PNG_CRC32_TABLE_ADDRESS));
 
     c->eax = result;
     if (data != 0U) {
