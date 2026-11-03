@@ -9,7 +9,10 @@ One port serves both sides:
       GET  /status            {"connected": true, "version": "...", ...}
       POST /run?timeout=60    body = Lua; answer = what it printed and returned (text)
       GET  /last              the last answer (when /run timed out before it came)
-Only one chunk runs at a time. Nothing is stored on disk.
+  * the console's background module (isaac-remote sysmodule, hello version "sys-...") connects the same way and
+    has its own endpoints: GET /sys/status, POST /sys/run (body = a command: help, ps, kill, relaunch, press,
+    regs, peek, ls, get, put...), GET /sys/last. It stays connected when the game hangs or crashes.
+Only one chunk runs at a time per side. Nothing is stored on disk.
 """
 import argparse, asyncio, hmac, json, time, urllib.parse
 
@@ -24,7 +27,8 @@ class State:
         self.last = ""
         self.busy = False
 
-S = State()
+GAME, SYS = State(), State()
+S = GAME
 KEY = ""
 
 def frame(t, payload: bytes) -> bytes:
@@ -40,6 +44,7 @@ async def console(reader, writer, first_line: bytes):
     key, _, version = hello.partition(" ")
     if not hmac.compare_digest(key, KEY):
         writer.close(); return
+    S = SYS if version.startswith("sys-") else GAME
     if S.writer:
         try: S.writer.close()
         except Exception: pass
@@ -76,6 +81,7 @@ async def console(reader, writer, first_line: bytes):
         writer.close()
 
 async def http(reader, writer, first_line: bytes):
+    S = GAME
     try:
         method, target, _ = first_line.decode("latin-1").split(" ", 2)
     except ValueError:
@@ -92,17 +98,20 @@ async def http(reader, writer, first_line: bytes):
         body = await reader.readexactly(min(int(headers["content-length"]), 1 << 20))
     url = urllib.parse.urlsplit(target)
     q = dict(urllib.parse.parse_qsl(url.query))
+    path = url.path
+    if path.startswith("/sys/"):
+        S, path = SYS, path[4:]
     status, out, ctype = 200, "", "text/plain; charset=utf-8"
     if not hmac.compare_digest(q.get("key", headers.get("x-key", "")), KEY):
         status, out = 403, "bad key"
-    elif url.path == "/status":
+    elif path == "/status":
         ctype = "application/json"
         out = json.dumps({"connected": S.writer is not None, "version": S.version, "busy": S.busy,
                           "since": S.since and round(time.time() - S.since),
                           "last_seen": S.last_seen and round(time.time() - S.last_seen)})
-    elif url.path == "/last":
+    elif path == "/last":
         out = S.last
-    elif url.path == "/run" and method == "POST":
+    elif path == "/run" and method == "POST":
         if not S.writer:
             status, out = 503, "console not connected"
         elif S.busy:
