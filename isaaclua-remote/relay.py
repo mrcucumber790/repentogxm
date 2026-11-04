@@ -48,6 +48,12 @@ async def console(reader, writer, first_line: bytes):
     if S.writer:
         try: S.writer.close()
         except Exception: pass
+    # a reconnect ends whatever the old connection was doing: free the slot and answer its waiters
+    S.busy = False
+    for f in S.waiting.values():
+        if not f.done():
+            f.set_result("ERROR the console reconnected")
+    S.waiting.clear()
     S.writer, S.version, S.since, S.last_seen = writer, version, time.time(), time.time()
     print(time.strftime("%H:%M:%S"), "console connected:", version, flush=True)
     try:
@@ -56,7 +62,7 @@ async def console(reader, writer, first_line: bytes):
             if not line:
                 break
             t, n = line.decode().split()
-            payload = await reader.readexactly(int(n))
+            payload = await asyncio.wait_for(reader.readexactly(int(n)), 120)  # a stalled reply must not hold the slot forever
             S.last_seen = time.time()
             if t == "R":
                 cid, _, text = payload.decode("utf-8", "replace").partition("\n")
